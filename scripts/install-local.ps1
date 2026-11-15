@@ -3,7 +3,9 @@
 param(
     [Parameter(Mandatory=$true)][string]$PackageDir,
     [string]$InstallDir = (Join-Path $env:LOCALAPPDATA 'Programs\AutoGui'),
-    [string]$BinDir = (Join-Path $env:USERPROFILE '.local\bin')
+    [string]$BinDir = (Join-Path $env:USERPROFILE '.local\bin'),
+    # Opt in only when preserving a running image by rename is intended.
+    [switch]$AllowInUseRename
 )
 $ErrorActionPreference = 'Stop'
 $utf8 = New-Object Text.UTF8Encoding($false)
@@ -33,6 +35,13 @@ function CheckUnlocked([string]$Path) {
         $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
         $stream.Dispose()
     }
+}
+function MoveVerified([string]$From,[string]$To,[string]$ExpectedHash) {
+    if ((FullPath $From) -ne $From -or (FullPath $To) -ne $To -or -not $movePairs.ContainsKey($From) -or $movePairs[$From] -ne $To) { throw "Unapproved move: $From -> $To" }
+    foreach ($path in @($From,$To)) { CheckPath $path }
+    if (-not (Test-Path -LiteralPath $From -PathType Leaf) -or (Test-Path -LiteralPath $To) -or (Hash $From) -ne $ExpectedHash) { throw "Move source/destination changed: $From -> $To" }
+    Move-Item -LiteralPath $From -Destination $To
+    if ((Hash $To) -ne $ExpectedHash) { throw "Moved checksum mismatch: $To" }
 }
 function StartProbe([string]$Path, [string]$Arguments) {
     $start = New-Object Diagnostics.ProcessStartInfo
@@ -135,7 +144,8 @@ foreach ($target in $targets) {
     $path = Join-Path $target.root $target.name
     if ($path.StartsWith($PackageDir + '\', [StringComparison]::OrdinalIgnoreCase)) { throw "Package cannot also be an installation target: $path" }
     CheckPath $path
-    CheckUnlocked $path
+    if (-not $AllowInUseRename) { CheckUnlocked $path }
+    elseif ((Test-Path -LiteralPath $path) -and -not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Expected a file: $path" }
     $uniqueTargets[$path] = $target
 }
 
@@ -145,9 +155,11 @@ CheckPath $transactionRoot
 if (Test-Path -LiteralPath $transactionRoot) { throw "Backup directory already exists: $transactionRoot" }
 $stageDir = Join-Path $transactionRoot 'stage'
 $backupDir = Join-Path $transactionRoot 'backup'
+$displacedDir = Join-Path $transactionRoot 'displaced'
 $manifestPath = Join-Path $transactionRoot 'manifest.json'
 New-Item -ItemType Directory -Path $stageDir | Out-Null
 New-Item -ItemType Directory -Path $backupDir | Out-Null
+if ($AllowInUseRename) { New-Item -ItemType Directory -Path $displacedDir | Out-Null }
 # Probe --version in isolation before placing the runtime beside either loader.
 $versions = @()
 foreach ($name in @('autogui-control.exe','rsgui-decision.exe')) {
@@ -162,35 +174,44 @@ if ((Hash (Join-Path $stageDir 'autogui_runtime.dll')) -ne $packageFiles[(Join-P
 foreach ($name in @('autogui-control.exe','rsgui-decision.exe')) { VerifyLoader (Join-Path $stageDir $name) -Mcp }
 
 $records = @()
+$movePairs = @{}
 foreach ($path in @($uniqueTargets.Keys | Sort-Object)) {
-    CheckUnlocked $path
+    if (-not $AllowInUseRename) { CheckUnlocked $path }
     $target = $uniqueTargets[$path]
     $existed = Test-Path -LiteralPath $path -PathType Leaf
     $oldHash = $null
     $backup = $null
+    $displaced = $null
     if ($existed) {
         $oldHash = Hash $path
         $backup = Join-Path $backupDir ('{0:D2}.bin' -f $records.Count)
         Copy-Item -LiteralPath $path -Destination $backup
         if ((Hash $backup) -ne $oldHash) { throw "Backup checksum mismatch: $backup" }
+        if ($AllowInUseRename) {
+            $displaced = Join-Path $displacedDir ('{0:D2}.bin' -f $records.Count)
+            $movePairs[$path] = $displaced
+            $movePairs[$displaced] = $path
+        }
     }
-    $records += [ordered]@{path=$path;source=$target.name;existed=$existed;old_sha256=$oldHash;new_sha256=$packageFiles[(Join-Path $PackageDir $target.name)].sha256;backup=$backup}
+    $records += [ordered]@{path=$path;source=$target.name;existed=$existed;old_sha256=$oldHash;new_sha256=$packageFiles[(Join-Path $PackageDir $target.name)].sha256;backup=$backup;displaced=$displaced}
 }
 $manifest = [ordered]@{
     schema=1;transaction_id=$transactionId;created_at=(Get-Date -Format 'o');state='installing'
     install_dir=$InstallDir;bin_dir=$BinDir;package_dir=$PackageDir;payload_sha256=$payloadHash;loader_version=$versions[0]
     integrity='Unsigned package; SHA256 verifies consistency, not publisher identity.';files=$records
+    allow_in_use_rename=[bool]$AllowInUseRename
 }
 [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8), $utf8)
 $attempted = @()
 try {
     foreach ($record in $records) {
-        CheckUnlocked $record.path
+        if (-not $AllowInUseRename) { CheckUnlocked $record.path }
         if ($record.existed -and (Hash $record.path) -ne $record.old_sha256) { throw "Target changed during installation: $($record.path)" }
         if (-not $record.existed -and (Test-Path -LiteralPath $record.path)) { throw "Target appeared during installation: $($record.path)" }
         $parent = Split-Path -Parent $record.path
         if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
         $attempted += $record
+        if ($record.displaced) { MoveVerified $record.path $record.displaced $record.old_sha256 }
         Copy-Item -LiteralPath (Join-Path $stageDir $record.source) -Destination $record.path -Force
         if ((Hash $record.path) -ne $record.new_sha256) { throw "Installed checksum mismatch: $($record.path)" }
     }
@@ -203,7 +224,14 @@ try {
     for ($index=$attempted.Count-1; $index -ge 0; $index--) {
         $record = $attempted[$index]
         try {
-            if ($record.existed) { Copy-Item -LiteralPath $record.backup -Destination $record.path -Force }
+            if ($record.displaced) {
+                if (Test-Path -LiteralPath $record.displaced) {
+                    CheckPath $record.path
+                    if (Test-Path -LiteralPath $record.path) { Remove-Item -LiteralPath $record.path -Force }
+                    MoveVerified $record.displaced $record.path $record.old_sha256
+                } elseif (-not (Test-Path -LiteralPath $record.path -PathType Leaf) -or (Hash $record.path) -ne $record.old_sha256) { throw "Original image missing: $($record.path); displaced=$($record.displaced)" }
+            }
+            elseif ($record.existed) { Copy-Item -LiteralPath $record.backup -Destination $record.path -Force }
             elseif (Test-Path -LiteralPath $record.path) { Remove-Item -LiteralPath $record.path -Force }
             if ($record.existed -and (Hash $record.path) -ne $record.old_sha256) { throw 'Restored checksum mismatch' }
         } catch { $rollbackFailures += "$($record.path): $($_.Exception.Message); backup=$($record.backup)" }
@@ -216,5 +244,6 @@ try {
 }
 Write-Host "Installed version $($versions[0]); unsigned package checksums and 19-tool MCP handshakes verified."
 Write-Host "Restore manifest: $manifestPath"
+if ($AllowInUseRename) { Write-Host 'Running old images are retained in displaced/. Exit processes using the new files before restore-local.ps1.' }
 # Return the durable manifest path for automation; no host config, PATH or .install metadata is edited.
 $manifestPath

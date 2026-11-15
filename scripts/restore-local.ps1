@@ -56,8 +56,10 @@ for ($index=0; $index -lt $records.Count; $index++) {
         CheckPath $record.backup
         if (-not (Test-Path -LiteralPath $record.backup -PathType Leaf) -or (Hash $record.backup) -ne $record.old_sha256) { throw "Backup checksum mismatch: $($record.backup)" }
     } elseif ($null -ne $record.backup -or $null -ne $record.old_sha256) { throw "Unexpected backup for a new file: $($record.path)" }
-    $stream = [IO.File]::Open($record.path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
-    $stream.Dispose()
+    try {
+        $stream = [IO.File]::Open($record.path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+        $stream.Dispose()
+    } catch { throw "Exit processes using the newly installed file before restoring: $($record.path). $($_.Exception.Message)" }
 }
 $attempted = @()
 try {
