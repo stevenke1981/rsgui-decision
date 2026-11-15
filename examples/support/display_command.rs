@@ -26,9 +26,6 @@ pub(super) fn move_window(
     if window.is_maximized()? {
         window.restore()?;
     }
-    let old = window.box_rect()?;
-    let width = old.width.min(bounds.width - 32);
-    let height = old.height.min(bounds.height - 32);
     let left = bounds
         .left
         .checked_add(16)
@@ -39,13 +36,17 @@ pub(super) fn move_window(
         .ok_or(Error::InvalidArgument("display coordinate overflow"))?;
     check()?;
     display.validate()?;
-    if old.width != width || old.height != height {
+    window.move_to(left, top)?;
+    check()?;
+    display.validate()?;
+    let moved = window.box_rect()?;
+    let width = moved.width.min(bounds.width - 32);
+    let height = moved.height.min(bounds.height - 32);
+    if moved.width != width || moved.height != height {
         window.resize_to(width, height)?;
         check()?;
         display.validate()?;
     }
-    window.move_to(left, top)?;
-    display.validate()?;
     let actual = window.box_rect()?;
     if actual.intersect(&bounds) != Some(actual) {
         return Err(Error::Input("app could not fit on the selected display; inspect its actual position and minimum size".into()));

@@ -174,16 +174,16 @@ fn integrated_decision_native_fixture() {
         json!({"request":request(&target,&captured,click.clone())}),
     );
     assert_eq!(output["isError"], false, "{output}");
-    let after = metadata(&output, "capture_id");
+    let after: Value =
+        serde_json::from_str(output["content"][0]["text"].as_str().unwrap()).unwrap();
     assert_eq!(after["input_sent"], true);
     assert_eq!(after["outcome"], "settled");
     assert_eq!(after["task_success"], "not_evaluated");
-    assert!(
-        output["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|block| block["type"] == "image")
+    assert_eq!(after["evaluation"]["decision"]["action"], "choose");
+    assert_eq!(output["content"][1]["type"], "image");
+    assert_eq!(
+        metadata(&output, "capture_id")["capture_id"],
+        after["capture_id"]
     );
     wait_until(|| fixture.clicks.load(Ordering::SeqCst) == 1);
 
@@ -247,9 +247,7 @@ fn integrated_decision_native_fixture() {
     // Unicode goes only to the fixture's focused edit; no model produces text.
     let edit = autogui::center(native_rect(fixture.handles.edit));
     gui.click_xy(edit.x, edit.y).unwrap();
-    unsafe {
-        HideCaret(fixture.handles.edit as HWND);
-    }
+    wait_until(|| unsafe { SendMessageW(fixture.handles.window as HWND, WM_APP, 0, 0) } != 0);
     let fresh = client.tool("capture", json!({"target":target}));
     let output = client.raw_tool(
         "decision_step",
@@ -303,7 +301,8 @@ fn integrated_decision_native_fixture() {
                 break;
             }
             assert!(started.elapsed() < Duration::from_secs(3));
-            std::thread::sleep(Duration::from_millis(pause));
+            let remaining = Duration::from_millis(100).saturating_sub(unchanged.elapsed());
+            std::thread::sleep(Duration::from_millis(pause).min(remaining));
             pause = (pause * 2).min(100);
         }
         baseline.push(started.elapsed().as_secs_f64() * 1000.0);

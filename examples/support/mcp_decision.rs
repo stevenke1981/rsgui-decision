@@ -1,9 +1,13 @@
 //! One immutable candidate, one action, then a cancellable local observation loop.
-use super::input::CaptureProof;
-use super::{Session, active, capture_region, decode, png, rect, screen_region, text};
+use super::input::{CaptureProof, validate_hotkey, validate_type_text};
+use super::{
+    PauseGuard, Session, active, capture_region, decode, encode_png_base64, png, rect,
+    screen_region, text,
+};
 use autogui::{Error, Rect, Result, Screenshot};
-use base64::Engine as _;
-use rsgui_decision_core::{ActionDecision, Candidate, Decision, DecisionInput, Engine, Facts};
+use rsgui_decision_core::{
+    ActionDecision, Candidate, Decision, DecisionInput, Engine, Error as DecisionError, Facts, Mode,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
@@ -98,10 +102,10 @@ impl WaitPolicy {
             || !(25..=1000).contains(&self.stable_ms)
             || !(5..=100).contains(&self.poll_ms)
             || self.poll_ms > self.stable_ms
-            || self.stable_ms > self.timeout_ms
+            || self.stable_ms >= self.timeout_ms
         {
             return Err(Error::InvalidArgument(
-                "wait: timeout 50..5000, stable 25..1000, poll 5..100 milliseconds; poll <= stable <= timeout",
+                "wait: timeout 50..5000, stable 25..1000, poll 5..100 milliseconds; poll <= stable < timeout",
             ));
         }
         Ok(self)
@@ -139,31 +143,19 @@ struct Frame {
 impl GuiAction {
     fn validate(&self, proof: &CaptureProof) -> Result<()> {
         match self {
-            Self::Click { x, y } | Self::Scroll { x, y, .. } => {
+            Self::Click { x, y } => {
                 proof.point(&proof.target, &proof.id, *x, *y)?;
             }
-            Self::TypeText { text } if text.is_empty() || text.chars().count() > 4096 => {
-                return Err(Error::InvalidArgument(
-                    "text must contain 1..4096 characters",
-                ));
+            Self::Scroll { x, y, clicks, .. } => {
+                proof.point(&proof.target, &proof.id, *x, *y)?;
+                if *clicks == 0 || !(-100..=100).contains(clicks) {
+                    return Err(Error::InvalidArgument(
+                        "scroll clicks must be nonzero and within -100..100",
+                    ));
+                }
             }
-            Self::Hotkey { keys }
-                if keys.is_empty()
-                    || keys.len() > 8
-                    || keys.iter().any(|key| key.is_empty() || key.len() > 32) =>
-            {
-                return Err(Error::InvalidArgument(
-                    "hotkey requires 1..8 canonical keys",
-                ));
-            }
-            _ => {}
-        }
-        if let Self::Scroll { clicks, .. } = self
-            && (*clicks == 0 || !(-100..=100).contains(clicks))
-        {
-            return Err(Error::InvalidArgument(
-                "scroll clicks must be nonzero and within -100..100",
-            ));
+            Self::TypeText { text } => validate_type_text(text, 1)?,
+            Self::Hotkey { keys } => validate_hotkey(keys)?,
         }
         Ok(())
     }
@@ -189,6 +181,37 @@ impl GuiAction {
     }
 }
 
+fn map_decision_error(error: DecisionError) -> Error {
+    match error {
+        DecisionError::Refused => {
+            Error::PermissionDenied("GEMINI_REFUSED: Gemini refused to answer a decision question")
+        }
+        other => Error::Input(format!("{}: {other}", other.code())),
+    }
+}
+
+fn merge_step_evaluation(output: &mut Value, evaluation: &Evaluation) {
+    let Some(content) = output["content"].as_array_mut() else {
+        return;
+    };
+    if let Some(first) = content.first_mut()
+        && let Some(raw) = first["text"].as_str()
+        && let Ok(mut obj) = serde_json::from_str::<serde_json::Map<String, Value>>(raw)
+    {
+        obj.insert("evaluation".into(), json!(evaluation));
+        first["text"] = json!(Value::Object(obj).to_string());
+    } else {
+        content.push(json!({"type":"text","text":json!({"evaluation":evaluation}).to_string()}));
+    }
+}
+
+fn observation_error(pending: &Pending, action: Value, error: &Error) -> Value {
+    json!({"isError":true,"content":[{"type":"text","text":json!({
+        "decision_id":pending.id,"candidate_id":pending.candidate.id,"input_attempted":true,
+        "input_sent":true,"outcome":"observation_error","error":error.to_string(),
+        "action":action,"automatic_retry":false}).to_string()}]})
+}
+
 impl Session {
     pub(super) fn decision_call(
         &mut self,
@@ -199,14 +222,16 @@ impl Session {
         match name {
             "decision_status" => {
                 let _: super::Empty = decode(args)?;
-                self.decision_engine()?;
-                Ok(text(
-                    json!({"mode":self.decisions.engine.as_ref().map(Engine::mode),
+                let mode = match self.decisions.engine.as_ref() {
+                    Some(engine) => engine.mode(),
+                    None => Engine::from_env().map_err(map_decision_error)?.mode(),
+                };
+                let provider_model = (mode != Mode::Local).then_some("gemini-decision-1");
+                Ok(text(json!({"mode":mode,
                     "evaluations":self.decisions.evaluations,"action_attempts":self.decisions.action_attempts,
                     "pending_decision":self.decisions.pending.as_ref().map(|pending| &pending.id),
-                    "provider_model":"gemini-decision-1","automatic_retries":false,
-                    "scope":"bounded GUI decisions; local single-candidate mode is deterministic, not visual understanding"}),
-                ))
+                    "provider_model":provider_model,"automatic_retries":false,
+                    "scope":"bounded GUI decisions; local single-candidate mode is deterministic, not visual understanding"})))
             }
             "decision_observe" => self.call("observe", args, check),
             "decision_evaluate" => {
@@ -237,15 +262,12 @@ impl Session {
                 let request: Step = decode(args)?;
                 let wait = request.wait.validate()?;
                 let evaluation = self.evaluate(request.request, check)?;
-                let meta = json!({"evaluation":evaluation});
                 if let Some(pending) = self.decisions.pending.take() {
                     let mut output = self.act_and_observe(pending, wait, false, check)?;
-                    if let Some(content) = output["content"].as_array_mut() {
-                        content.insert(0, json!({"type":"text","text":meta.to_string()}));
-                    }
+                    merge_step_evaluation(&mut output, &evaluation);
                     Ok(output)
                 } else {
-                    Ok(text(meta))
+                    Ok(text(json!({"evaluation":evaluation})))
                 }
             }
             _ => Err(Error::InvalidArgument("unknown decision tool")),
@@ -254,8 +276,7 @@ impl Session {
 
     fn decision_engine(&mut self) -> Result<()> {
         if self.decisions.engine.is_none() {
-            self.decisions.engine =
-                Some(Engine::from_env().map_err(|e| Error::Input(e.to_string()))?);
+            self.decisions.engine = Some(Engine::from_env().map_err(map_decision_error)?);
         }
         Ok(())
     }
@@ -266,7 +287,7 @@ impl Session {
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         check()?;
-        proof.point(&proof.target, &proof.id, 0, 0)?;
+        proof.fresh()?;
         let window = self.target(&proof.target)?;
         let display = proof
             .display
@@ -280,8 +301,9 @@ impl Session {
             ));
         }
         let gui = self.gui()?;
-        if screen_region(gui, &window, display.as_ref())? != proof.region
-            || capture_region(gui, display.as_ref(), proof.region)? != proof.frame
+        let mut guard = PauseGuard::zero(gui);
+        if screen_region(guard.gui(), &window, display.as_ref())? != proof.region
+            || capture_region(guard.gui(), display.as_ref(), proof.region)? != proof.frame
         {
             return Err(Error::InvalidArgument(
                 "observed pixels/display changed; observe again",
@@ -302,19 +324,43 @@ impl Session {
         request: Evaluate,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Evaluation> {
-        let proof = self
-            .capture
-            .as_ref()
-            .ok_or(Error::InvalidArgument(
+        {
+            let proof = self.capture.as_ref().ok_or(Error::InvalidArgument(
                 "capture/observe the selected window first",
-            ))?
-            .clone();
-        if proof.target != request.target || proof.id != request.capture_id {
-            return Err(Error::InvalidArgument("observation target/id mismatch"));
+            ))?;
+            if proof.target != request.target || proof.id != request.capture_id {
+                return Err(Error::InvalidArgument("observation target/id mismatch"));
+            }
+            for candidate in &request.candidates {
+                candidate.action.validate(proof)?;
+            }
         }
-        for candidate in &request.candidates {
-            candidate.action.validate(&proof)?;
+        if request.goal.trim().is_empty() || request.goal.chars().count() > 16_000 {
+            return Err(Error::InvalidArgument(
+                "goal must contain 1..16000 characters",
+            ));
         }
+        if !(1..=32).contains(&request.candidates.len()) {
+            return Err(Error::InvalidArgument("there must be 1..32 candidates"));
+        }
+        if !request.minimum_confidence.is_finite()
+            || !(0.5..=1.0).contains(&request.minimum_confidence)
+        {
+            return Err(Error::InvalidArgument(
+                "minimum_confidence must be finite and 0.5..1",
+            ));
+        }
+        self.decision_engine()?;
+        let mode = self
+            .decisions
+            .engine
+            .as_ref()
+            .ok_or(Error::InvalidArgument("decision engine unavailable"))?
+            .mode();
+        let proof = self.capture.take().ok_or(Error::InvalidArgument(
+            "capture/observe the selected window first",
+        ))?;
+        // Drift/staleness invalidates self.capture by leaving it None.
         self.verify_observation(&proof, check)?;
         let candidates = request
             .candidates
@@ -332,45 +378,45 @@ impl Session {
         } else {
             Facts::Unknown
         };
+        let needs_image = mode != Mode::Local && facts == Facts::Unknown;
         let input = DecisionInput {
             goal: request.goal,
             candidates,
             facts,
             minimum_confidence: request.minimum_confidence,
         };
-        self.decision_engine()?;
-        let image = if input.candidates.len() > 1 {
-            let rgb = image::RgbImage::from_raw(
-                proof.frame.width,
-                proof.frame.height,
-                proof.frame.pixels.clone(),
-            )
-            .ok_or(Error::InvalidArgument("invalid observation frame"))?;
-            let mut bytes = std::io::Cursor::new(Vec::new());
-            rgb.write_to(&mut bytes, image::ImageFormat::Png)
-                .map_err(|e| Error::Screenshot(e.to_string()))?;
-            if bytes.get_ref().len() > 12 * 1024 * 1024 {
-                return Err(Error::InvalidArgument(
-                    "decision image exceeds 12 MiB; resize the window",
-                ));
+        let image = if needs_image {
+            match encode_png_base64(&proof.frame) {
+                Ok(data) => Some(data),
+                Err(error) => {
+                    self.capture = Some(proof);
+                    return Err(error);
+                }
             }
-            Some(base64::engine::general_purpose::STANDARD.encode(bytes.into_inner()))
         } else {
             None
         };
-        let decision = self
+        let decision = match self
             .decisions
             .engine
             .as_mut()
             .ok_or(Error::InvalidArgument("decision engine unavailable"))?
             .evaluate(&input, image.as_deref(), &|| {
                 check().map_err(std::io::Error::other)
-            })
-            .map_err(|e| Error::Input(e.to_string()))?;
+            }) {
+            Ok(decision) => decision,
+            Err(error) => {
+                self.capture = Some(proof);
+                return Err(map_decision_error(error));
+            }
+        };
         // Inference is advisory; changed pixels during the request invalidate its result.
         if decision.calls > 0 {
             self.verify_observation(&proof, check)?;
         }
+        let target = proof.target.clone();
+        let capture_id = proof.id.clone();
+        self.capture = Some(proof);
         self.decisions.evaluations += 1;
         let mut decision_id = None;
         if decision.action == ActionDecision::Choose {
@@ -390,8 +436,8 @@ impl Session {
             decision_id = Some(id.clone());
             self.decisions.pending = Some(Pending {
                 id,
-                target: proof.target,
-                capture_id: proof.id,
+                target,
+                capture_id,
                 candidate,
             });
         }
@@ -414,13 +460,14 @@ impl Session {
         active(&window)?;
         let bounds = window.box_rect()?;
         let gui = self.gui()?;
-        let region = screen_region(gui, &window, display.as_ref())?;
+        let mut guard = PauseGuard::zero(gui);
+        let region = screen_region(guard.gui(), &window, display.as_ref())?;
         if i64::from(region.width) * i64::from(region.height) > 16_777_216 {
             return Err(Error::InvalidArgument(
                 "capture exceeds 16 megapixels; resize window",
             ));
         }
-        let pixels = capture_region(gui, display.as_ref(), region)?;
+        let pixels = capture_region(guard.gui(), display.as_ref(), region)?;
         let taken = Instant::now();
         active(&window)?;
         if window.box_rect()? != bounds {
@@ -473,11 +520,15 @@ impl Session {
         let observed = self.wait_for_frame(&pending.target, display.as_deref(), wait, check);
         match observed {
             Ok((frame, settled, samples)) => {
-                self.capture_generation = self
-                    .capture_generation
-                    .checked_add(1)
-                    .ok_or(Error::InvalidArgument("restart capture session"))?;
-                let id = format!("c{}", self.capture_generation);
+                let Some(next_generation) = self.capture_generation.checked_add(1) else {
+                    self.capture = None;
+                    return Ok(observation_error(
+                        &pending,
+                        action,
+                        &Error::InvalidArgument("restart capture session"),
+                    ));
+                };
+                let id = format!("c{next_generation}");
                 let metadata = json!({"target":pending.target,"display":display,"region":rect(frame.region),
                     "capture_id":id,"pointer_coordinates":"image-relative pixels; origin at captured image top-left",
                     "expires_in_seconds":60,"single_use":true,"decision_id":pending.id,
@@ -485,7 +536,14 @@ impl Session {
                     "outcome":if settled {"settled"} else {"timeout"},"task_success":"not_evaluated",
                     "samples":samples,"latency_ms":started.elapsed().as_millis(),"action":action,
                     "note":"Visual stability is not semantic completion. Inspect this fresh capture before the next action."});
-                let output = png(frame.pixels.clone(), metadata)?;
+                let output = match png(&frame.pixels, metadata) {
+                    Ok(output) => output,
+                    Err(error) => {
+                        self.capture = None;
+                        return Ok(observation_error(&pending, action, &error));
+                    }
+                };
+                self.capture_generation = next_generation;
                 self.capture = Some(CaptureProof {
                     id,
                     target: pending.target,
@@ -493,18 +551,13 @@ impl Session {
                     bounds: frame.bounds,
                     region: frame.region,
                     frame: frame.pixels,
-                    taken: frame.taken,
+                    taken: Instant::now(),
                 });
                 Ok(output)
             }
             Err(error) => {
                 self.capture = None;
-                Ok(
-                    json!({"isError":true,"content":[{"type":"text","text":json!({
-                    "decision_id":pending.id,"candidate_id":pending.candidate.id,"input_attempted":true,
-                    "input_sent":true,"outcome":"observation_error","error":error.to_string(),
-                    "action":action,"automatic_retry":false}).to_string()}]}),
-                )
+                Ok(observation_error(&pending, action, &error))
             }
         }
     }
@@ -531,10 +584,10 @@ impl Session {
                     || old.region != frame.region
                     || old.pixels != frame.pixels
             }) {
-                unchanged_since = Instant::now();
+                unchanged_since = frame.taken;
                 interval = policy.poll_ms;
             }
-            if unchanged_since.elapsed() >= stable {
+            if previous.is_some() && unchanged_since.elapsed() >= stable {
                 return Ok((frame, true, samples));
             }
             if start.elapsed() >= timeout {
@@ -542,8 +595,12 @@ impl Session {
             }
             previous = Some(frame);
             check()?;
+            let remaining_stable = stable.saturating_sub(unchanged_since.elapsed());
+            let remaining_timeout = timeout.saturating_sub(start.elapsed());
             std::thread::sleep(
-                Duration::from_millis(interval).min(timeout.saturating_sub(start.elapsed())),
+                Duration::from_millis(interval)
+                    .min(remaining_stable)
+                    .min(remaining_timeout),
             );
             interval = (interval * 2).min(100);
         }
@@ -646,6 +703,28 @@ mod tests {
                 .decision_call("decision_act", json!({"decision_id":"unknown"}), &|| Ok(()))
                 .is_err()
         );
+        assert!(
+            session
+                .decision_call(
+                    "decision_evaluate",
+                    json!({"target":"w1","capture_id":"c1","goal":"   ","candidates":[{
+                        "id":"click","description":"test","action":{"type":"click","x":1,"y":1}}]}),
+                    &|| Ok(())
+                )
+                .is_err()
+        );
+        assert!(
+            session
+                .decision_call(
+                    "decision_evaluate",
+                    json!({"target":"w1","capture_id":"c1","goal":"test","candidates":[{
+                        "id":"hotkey","description":"test","action":{"type":"hotkey","keys":["not_a_key"]}}]}),
+                    &|| Ok(())
+                )
+                .is_err()
+        );
+        assert!(session.gui.is_none());
+        assert!(session.capture.is_some());
         assert_eq!(session.decisions.action_attempts, 0);
     }
 
@@ -678,11 +757,92 @@ mod tests {
                 .is_err()
         );
         assert!(
+            WaitPolicy {
+                timeout_ms: 100,
+                stable_ms: 100,
+                poll_ms: 25
+            }
+            .validate()
+            .is_err()
+        );
+        assert!(
             GuiAction::TypeText {
                 text: String::new()
             }
             .validate(&proof())
             .is_err()
         );
+        assert!(
+            GuiAction::TypeText {
+                text: "hello\0world".into()
+            }
+            .validate(&proof())
+            .is_err()
+        );
+        assert!(
+            GuiAction::Hotkey {
+                keys: vec!["ctrl".into(), "not_a_key".into()]
+            }
+            .validate(&proof())
+            .is_err()
+        );
+        assert!(
+            GuiAction::Hotkey {
+                keys: vec!["ctrl".into(), "insert".into()]
+            }
+            .validate(&proof())
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn step_merges_evaluation_into_content_zero_and_status_stays_read_only() {
+        let mut session = Session::default();
+        let status = session
+            .decision_call("decision_status", json!({}), &|| Ok(()))
+            .unwrap();
+        assert!(session.decisions.engine.is_none());
+        let status_json: Value =
+            serde_json::from_str(status["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(status_json["mode"], "local");
+        assert!(status_json["provider_model"].is_null());
+
+        let pending = Pending {
+            id: "d1".into(),
+            target: "w1".into(),
+            capture_id: "c1".into(),
+            candidate: GuiCandidate {
+                id: "click".into(),
+                description: "test".into(),
+                action: GuiAction::Click { x: 1, y: 1 },
+            },
+        };
+        let mut out = observation_error(
+            &pending,
+            json!({"clicked":true}),
+            &Error::InvalidArgument("boom"),
+        );
+        let eval = Evaluation {
+            decision_id: Some("d1".into()),
+            decision: Decision {
+                action: ActionDecision::Choose,
+                candidate_id: Some("click".into()),
+                confidence: None,
+                source: "local".into(),
+                calls: 0,
+                latency_ms: 0,
+                input_tokens: None,
+                estimated_cost_usd: None,
+                error: None,
+                error_code: None,
+            },
+            note: "note",
+        };
+        merge_step_evaluation(&mut out, &eval);
+        let merged: Value =
+            serde_json::from_str(out["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(merged["outcome"], "observation_error");
+        assert_eq!(merged["input_sent"], true);
+        assert_eq!(merged["evaluation"]["decision_id"], "d1");
     }
 }

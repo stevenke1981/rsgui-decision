@@ -15,7 +15,7 @@ pub(super) struct CaptureProof {
 }
 
 impl CaptureProof {
-    fn fresh(&self) -> Result<()> {
+    pub(super) fn fresh(&self) -> Result<()> {
         if self.taken.elapsed() >= Duration::from_secs(60) {
             return Err(Error::InvalidArgument("capture expired; capture again"));
         }
@@ -100,6 +100,36 @@ impl CaptureProof {
         }
         Ok(())
     }
+}
+
+pub(super) fn validate_type_text(text: &str, min_chars: usize) -> Result<()> {
+    let count = text.chars().count();
+    if count < min_chars || count > 4096 {
+        return Err(if min_chars == 1 {
+            Error::InvalidArgument("text must contain 1..4096 characters")
+        } else {
+            Error::InvalidArgument("text exceeds 4096 characters; send smaller chunks")
+        });
+    }
+    if text.contains('\0') {
+        return Err(Error::InvalidArgument("text must not contain NUL bytes"));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_hotkey(keys: &[String]) -> Result<()> {
+    if keys.is_empty() || keys.len() > 8 || keys.iter().any(|key| key.is_empty() || key.len() > 32)
+    {
+        return Err(Error::InvalidArgument(
+            "use 1..8 canonical keys, e.g. ctrl,a or enter",
+        ));
+    }
+    if keys.iter().any(|key| autogui::normalize(key).is_none()) {
+        return Err(Error::InvalidArgument(
+            "unknown hotkey name; use canonical key names e.g. ctrl,a or enter",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn type_chunks(text: &str, mut send: impl FnMut(&str) -> Result<()>) -> Result<()> {
@@ -201,5 +231,17 @@ mod tests {
         });
         assert!(matches!(error, Err(Error::PermissionDenied(_))));
         assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn text_and_hotkey_validation_rejects_nul_and_unknown_keys() {
+        assert!(validate_type_text("", 0).is_ok());
+        assert!(validate_type_text("", 1).is_err());
+        assert!(validate_type_text("abc\0def", 0).is_err());
+        assert!(validate_type_text("abc\0def", 1).is_err());
+        assert!(validate_hotkey(&["ctrl".into(), "a".into()]).is_ok());
+        assert!(validate_hotkey(&["insert".into()]).is_ok());
+        assert!(validate_hotkey(&["ctrl".into(), "not_a_real_key".into()]).is_err());
+        assert!(validate_hotkey(&[]).is_err());
     }
 }
