@@ -39,12 +39,11 @@ impl Drop for DpiGuard {
 }
 
 #[cfg(windows)]
-pub(crate) fn cursor_position() -> Result<crate::types::Point> {
+pub(crate) fn cursor_position_in_dpi() -> Result<crate::types::Point> {
     use windows_sys::Win32::{
         Foundation::{GetLastError, POINT},
         UI::WindowsAndMessaging::GetCursorPos,
     };
-    let _dpi = DpiGuard::enter()?;
     let mut point = POINT::default();
     if unsafe { GetCursorPos(&mut point) } == 0 {
         let code = unsafe { GetLastError() };
@@ -60,6 +59,12 @@ pub(crate) fn cursor_position() -> Result<crate::types::Point> {
         };
     }
     Ok(crate::types::Point::new(point.x, point.y))
+}
+
+#[cfg(windows)]
+pub(crate) fn cursor_position() -> Result<crate::types::Point> {
+    let _dpi = DpiGuard::enter()?;
+    cursor_position_in_dpi()
 }
 
 #[cfg(not(windows))]

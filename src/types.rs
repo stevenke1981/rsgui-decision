@@ -213,22 +213,47 @@ impl Screenshot {
             .ok_or(crate::error::Error::InvalidArgument(
                 "region does not intersect image",
             ))?;
-        let mut pixels = Vec::with_capacity(clipped.width as usize * clipped.height as usize * 3);
+        let row_stride = (self.width as usize)
+            .checked_mul(3)
+            .ok_or(crate::error::Error::InvalidArgument("pixel index overflow"))?;
+        let copy_bytes = (clipped.width as usize)
+            .checked_mul(3)
+            .ok_or(crate::error::Error::InvalidArgument("pixel index overflow"))?;
+        let left_bytes = (clipped.left as usize)
+            .checked_mul(3)
+            .ok_or(crate::error::Error::InvalidArgument("pixel index overflow"))?;
+        let mut pixels = Vec::with_capacity(clipped.height as usize * copy_bytes);
         for y in clipped.top..clipped.bottom() {
-            for x in clipped.left..clipped.right() {
-                let pixel = self.get_pixel(x, y)?;
-                pixels.extend_from_slice(&[pixel.r, pixel.g, pixel.b]);
-            }
+            let row_start = (y as usize)
+                .checked_mul(row_stride)
+                .and_then(|offset| offset.checked_add(left_bytes))
+                .ok_or(crate::error::Error::InvalidArgument("pixel index overflow"))?;
+            let row_end = row_start
+                .checked_add(copy_bytes)
+                .ok_or(crate::error::Error::InvalidArgument("pixel index overflow"))?;
+            let row = self
+                .pixels
+                .get(row_start..row_end)
+                .ok_or(crate::error::Error::InvalidArgument("invalid pixel buffer"))?;
+            pixels.extend_from_slice(row);
         }
         Screenshot::new(clipped.width as u32, clipped.height as u32, pixels)
     }
 
     pub fn save<P: AsRef<std::path::Path>>(&self, path: P) -> crate::error::Result<()> {
-        let image = image::RgbImage::from_raw(self.width, self.height, self.pixels.clone())
-            .ok_or(crate::error::Error::InvalidArgument("invalid pixel buffer"))?;
-        image
-            .save(path)
-            .map_err(|error| crate::error::Error::Screenshot(error.to_string()))
+        let expected_len = usize::try_from(u64::from(self.width) * u64::from(self.height) * 3)
+            .map_err(|_| crate::error::Error::InvalidArgument("invalid pixel buffer"))?;
+        if self.pixels.len() != expected_len {
+            return Err(crate::error::Error::InvalidArgument("invalid pixel buffer"));
+        }
+        image::save_buffer(
+            path,
+            &self.pixels,
+            self.width,
+            self.height,
+            image::ColorType::Rgb8,
+        )
+        .map_err(|error| crate::error::Error::Screenshot(error.to_string()))
     }
 
     pub fn load<P: AsRef<std::path::Path>>(path: P) -> crate::error::Result<Self> {
@@ -319,9 +344,25 @@ mod tests {
 
     #[test]
     fn screenshot_region_clips_to_image_bounds() {
-        let screenshot = Screenshot::solid(4, 3, Rgb::new(1, 2, 3));
-        let cropped = screenshot.region(Rect::new(-1, 1, 3, 5)).unwrap();
-        assert_eq!((cropped.width, cropped.height), (2, 2));
-        assert_eq!(cropped.get_pixel(1, 1).unwrap(), Rgb::new(1, 2, 3));
+        let mut screenshot = Screenshot::solid(4, 3, Rgb::new(1, 2, 3));
+        for y in 0..3 {
+            for x in 0..4 {
+                screenshot
+                    .set_pixel(x, y, Rgb::new(x as u8 * 10, y as u8 * 20, 7))
+                    .unwrap();
+            }
+        }
+        let cropped = screenshot.region(Rect::new(1, 1, 5, 2)).unwrap();
+        assert_eq!((cropped.width, cropped.height), (3, 2));
+        assert_eq!(cropped.get_pixel(0, 0).unwrap(), Rgb::new(10, 20, 7));
+        assert_eq!(cropped.get_pixel(2, 1).unwrap(), Rgb::new(30, 40, 7));
+
+        let invalid = Screenshot {
+            width: 4,
+            height: 3,
+            pixels: vec![0; 5],
+        };
+        assert!(invalid.region(Rect::new(0, 0, 2, 2)).is_err());
+        assert!(invalid.save("unused.png").is_err());
     }
 }

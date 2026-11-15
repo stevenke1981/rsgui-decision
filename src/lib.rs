@@ -21,6 +21,7 @@ pub use backend::FakeBackend;
 pub use display::Display;
 pub use error::{Error, Result};
 pub use gui::{AutoGui, KeyHold};
+pub use keys::normalize;
 pub use locate::LocateOptions;
 pub use settings::Settings;
 pub use tween::Tween;

@@ -106,9 +106,8 @@ impl AutoGui {
         Ok(())
     }
 
-    fn after_write(&mut self) -> Result<()> {
-        let pos = self.backend.mouse_pos()?;
-        failsafe::check(&self.settings, pos)?;
+    fn after_pause(&self) -> Result<()> {
+        self.before_action()?;
         if !self.settings.pause.is_zero() {
             thread::sleep(self.settings.pause);
         }
@@ -116,23 +115,18 @@ impl AutoGui {
             thread::sleep(self.settings.darwin_catch_up);
         }
         Ok(())
+    }
+
+    fn after_write(&mut self) -> Result<()> {
+        self.after_pause()
     }
 
     fn before_read_heavy(&self) -> Result<()> {
-        let pos = self.backend.mouse_pos()?;
-        failsafe::check(&self.settings, pos)
+        self.before_action()
     }
 
     fn after_read_heavy(&self) -> Result<()> {
-        let pos = self.backend.mouse_pos()?;
-        failsafe::check(&self.settings, pos)?;
-        if !self.settings.pause.is_zero() {
-            thread::sleep(self.settings.pause);
-        }
-        if cfg!(target_os = "macos") && !self.settings.darwin_catch_up.is_zero() {
-            thread::sleep(self.settings.darwin_catch_up);
-        }
-        Ok(())
+        self.after_pause()
     }
 
     pub fn size(&self) -> Result<Size> {
@@ -327,25 +321,29 @@ impl AutoGui {
         self.before_action()?;
         let mut buffer = String::new();
         for ch in text.chars() {
-            self.before_action()?;
             if ch == '\n' || ch == '\t' {
                 if !buffer.is_empty() {
+                    self.before_action()?;
                     self.backend.text(&buffer)?;
                     buffer.clear();
                 }
+                self.before_action()?;
                 let key = if ch == '\n' { "enter" } else { "tab" };
                 self.backend.key(key, true)?;
                 self.backend.key(key, false)?;
+                self.wait_input_interval(interval)?;
             } else {
                 buffer.push(ch);
                 if !interval.is_zero() || buffer.len() >= 256 {
+                    self.before_action()?;
                     self.backend.text(&buffer)?;
                     buffer.clear();
+                    self.wait_input_interval(interval)?;
                 }
             }
-            self.wait_input_interval(interval)?;
         }
         if !buffer.is_empty() {
+            self.before_action()?;
             self.backend.text(&buffer)?;
         }
         self.after_write()
@@ -494,16 +492,20 @@ impl AutoGui {
     /// Callers can recheck their target/focus/cancellation before sending input.
     pub fn move_to_display(&mut self, display: &Display, point: Point) -> Result<()> {
         self.before_action()?;
-        display.validate()?;
+        let virtual_bounds = display.validate_with_virtual_bounds()?;
         if !display.contains(point) {
             return Err(Error::InvalidArgument(
                 "point is outside the selected display",
             ));
         }
-        self.backend.move_mouse_desktop(point)?;
+        self.backend.move_mouse_desktop_in(point, virtual_bounds)?;
         let start = Instant::now();
-        while self.backend.mouse_pos()? != point {
-            self.before_action()?;
+        loop {
+            let pos = self.backend.mouse_pos()?;
+            failsafe::check(&self.settings, pos)?;
+            if pos == point {
+                break;
+            }
             if start.elapsed() >= Duration::from_millis(100) {
                 return Err(Error::Input(
                     "cursor did not reach selected display point; no click sent".into(),
@@ -511,7 +513,6 @@ impl AutoGui {
             }
             thread::sleep(Duration::from_millis(2));
         }
-        display.validate()?;
         self.after_write()?;
         if self.backend.mouse_pos()? != point {
             return Err(Error::Input(
@@ -966,5 +967,36 @@ mod tests {
     fn pixel_tolerance_via_types() {
         assert!(Rgb::new(10, 10, 10).matches(Rgb::new(12, 8, 10), 2));
         assert!(!Rgb::new(10, 10, 10).matches(Rgb::new(12, 8, 10), 1));
+    }
+
+    #[test]
+    fn read_heavy_paths_respect_pause_and_skip_sleep_when_zero() {
+        let mut fake = FakeBackend::new(40, 40);
+        fake.pos = Point::new(20, 20);
+        let mut g = AutoGui::with_fake(fake);
+        g.settings_mut().pause = Duration::from_millis(80);
+        g.settings_mut().failsafe = true;
+
+        let query_started = Instant::now();
+        let _ = g.size().unwrap();
+        let _ = g.position().unwrap();
+        assert!(query_started.elapsed() < Duration::from_millis(40));
+
+        let read_started = Instant::now();
+        let shot = g.screenshot().unwrap();
+        let needle = Screenshot::solid(2, 2, Rgb::new(0, 0, 0));
+        let _ = g.locate(&needle, &shot, &LocateOptions::default()).unwrap();
+        assert!(read_started.elapsed() >= Duration::from_millis(120));
+
+        g.settings_mut().pause = Duration::ZERO;
+        let zero_started = Instant::now();
+        let _ = g.locate(&needle, &shot, &LocateOptions::default()).unwrap();
+        assert!(zero_started.elapsed() < Duration::from_millis(40));
+
+        g.settings_mut().failsafe_points = vec![Point::new(20, 20)];
+        assert!(matches!(
+            g.locate(&needle, &shot, &LocateOptions::default()),
+            Err(Error::FailSafe(_))
+        ));
     }
 }

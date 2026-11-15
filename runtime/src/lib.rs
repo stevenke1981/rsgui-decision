@@ -34,15 +34,24 @@ pub unsafe extern "C" fn autogui_call_json(
     reply: Reply,
     context: *mut c_void,
 ) -> i32 {
-    if input.is_null() || len > 1_048_576 {
+    if input.is_null() {
         return 1;
+    }
+    if len > 1_048_576 {
+        return 2;
     }
     let result = std::panic::catch_unwind(|| {
         let bytes = unsafe { std::slice::from_raw_parts(input, len) };
-        let request: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
-        let name = request["name"]
-            .as_str()
-            .ok_or_else(|| std::io::Error::other("missing name"))?;
+        let mut request: Value = serde_json::from_slice(bytes).map_err(std::io::Error::other)?;
+        let Some(map) = request.as_object_mut() else {
+            return Err(std::io::Error::other("invalid runtime request"));
+        };
+        let name = map
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| std::io::Error::other("missing name"))?
+            .to_owned();
+        let args = map.remove("arguments").unwrap_or(Value::Null);
         let check = || {
             if unsafe { check(context) } {
                 Ok(())
@@ -52,10 +61,7 @@ pub unsafe extern "C" fn autogui_call_json(
                 ))
             }
         };
-        let value = SESSION.with(|s| {
-            s.borrow_mut()
-                .call(name, request["arguments"].clone(), &check)
-        });
+        let value = SESSION.with(|s| s.borrow_mut().call(&name, args, &check));
         let value = match value {
             Ok(v) => v,
             Err(e) => json!({"content":[{"type":"text","text":e.to_string()}],"isError":true}),
@@ -70,4 +76,44 @@ pub unsafe extern "C" fn autogui_call_json(
 #[unsafe(no_mangle)]
 pub extern "C" fn autogui_session_close() {
     let _ = std::panic::catch_unwind(|| SESSION.with(|s| *s.borrow_mut() = Default::default()));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    unsafe extern "C" fn always_ok(_: *mut c_void) -> bool {
+        true
+    }
+
+    unsafe extern "C" fn capture_reply(ctx: *mut c_void, bytes: *const u8, len: usize) {
+        let out = unsafe { &mut *(ctx as *mut Vec<u8>) };
+        *out = unsafe { std::slice::from_raw_parts(bytes, len) }.to_vec();
+    }
+
+    #[test]
+    fn abi_version_and_size_status_codes() {
+        assert_eq!(autogui_abi_version(), 1);
+        let mut out = Vec::<u8>::new();
+        let ctx = (&mut out as *mut Vec<u8>).cast();
+        assert_eq!(
+            unsafe { autogui_call_json(std::ptr::null(), 0, always_ok, capture_reply, ctx) },
+            1
+        );
+        let payload = b"{}";
+        assert_eq!(
+            unsafe {
+                autogui_call_json(payload.as_ptr(), 1_048_577, always_ok, capture_reply, ctx)
+            },
+            2
+        );
+        let req = br#"{"name":"session_status","arguments":{}}"#;
+        assert_eq!(
+            unsafe { autogui_call_json(req.as_ptr(), req.len(), always_ok, capture_reply, ctx) },
+            0
+        );
+        let parsed: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(parsed["isError"], false);
+        autogui_session_close();
+    }
 }

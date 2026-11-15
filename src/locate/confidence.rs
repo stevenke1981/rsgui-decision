@@ -32,15 +32,20 @@ impl Template {
         let mut means = Vec::with_capacity(channels);
         let mut centered = Vec::with_capacity(channels);
         let mut variance = 0.0;
+        let pixels = needle.pixels.as_chunks::<3>().0;
         for channel in 0..channels {
-            let mean = (0..count)
-                .map(|i| value(needle, i, channel, gray))
-                .sum::<f64>()
-                / count as f64;
-            let plane: Vec<f64> = (0..count)
-                .map(|i| value(needle, i, channel, gray) - mean)
-                .collect();
-            variance += plane.iter().map(|v| v * v).sum::<f64>();
+            let mut sum = 0u64;
+            let mut plane = Vec::with_capacity(count);
+            for p in pixels {
+                let v = if gray { luma(p) } else { p[channel] };
+                sum += u64::from(v);
+                plane.push(f64::from(v));
+            }
+            let mean = sum as f64 / count as f64;
+            for v in &mut plane {
+                *v -= mean;
+                variance += *v * *v;
+            }
             means.push(mean);
             centered.push(plane);
         }
@@ -205,20 +210,19 @@ fn patch_statistics(
     let mut sums = vec![0u64; stride * rows];
     let mut squares = vec![0u64; stride * rows];
     let count = u128::from(needle.width) * u128::from(needle.height);
+    let hay_stride = hay.width as usize * 3;
     for channel in 0..template.channels {
+        let gray = template.channels == 1;
         for y in 1..rows {
             if y % 32 == 0 {
                 check()?;
             }
             let mut sum = 0u64;
             let mut square = 0u64;
-            for x in 1..stride {
-                let v = value(
-                    hay,
-                    (y - 1) * hay.width as usize + x - 1,
-                    channel,
-                    template.channels == 1,
-                ) as u64;
+            let row_start = (y - 1) * hay_stride;
+            let row = &hay.pixels[row_start..row_start + hay_stride];
+            for (x, p) in (1..stride).zip(row.as_chunks::<3>().0.iter()) {
+                let v = u64::from(if gray { luma(p) } else { p[channel] });
                 sum += v;
                 square += v * v;
                 sums[y * stride + x] = sums[(y - 1) * stride + x] + sum;
@@ -282,20 +286,19 @@ struct Transform {
 }
 
 impl Transform {
-    fn run(&self, buffer: &mut [Complex<f64>], check: Check<'_>) -> Result<()> {
-        let mut scratch = vec![
-            Complex::default();
-            self.row
-                .get_inplace_scratch_len()
-                .max(self.column.get_inplace_scratch_len())
-        ];
+    fn run(
+        &self,
+        buffer: &mut [Complex<f64>],
+        scratch: &mut [Complex<f64>],
+        column: &mut [Complex<f64>],
+        check: Check<'_>,
+    ) -> Result<()> {
         for (index, row) in buffer.chunks_exact_mut(self.width).enumerate() {
             if index % 32 == 0 {
                 check()?;
             }
-            self.row.process_with_scratch(row, &mut scratch);
+            self.row.process_with_scratch(row, scratch);
         }
-        let mut column = vec![Complex::default(); self.height];
         for x in 0..self.width {
             if x % 32 == 0 {
                 check()?;
@@ -303,7 +306,7 @@ impl Transform {
             for y in 0..self.height {
                 column[y] = buffer[y * self.width + x];
             }
-            self.column.process_with_scratch(&mut column, &mut scratch);
+            self.column.process_with_scratch(column, scratch);
             for y in 0..self.height {
                 buffer[y * self.width + x] = column[y];
             }
@@ -318,6 +321,14 @@ fn cross_correlation(
     template: &Template,
     check: Check<'_>,
 ) -> Result<Vec<f64>> {
+    let columns = (hay.width - needle.width + 1) as usize;
+    let rows = (hay.height - needle.height + 1) as usize;
+    let active_channels: Vec<usize> = (0..template.channels)
+        .filter(|&channel| template.centered[channel].iter().any(|v| v.abs() > 1e-12))
+        .collect();
+    if active_channels.is_empty() {
+        return Ok(vec![0.0; columns * rows]);
+    }
     let width = fft_len(hay.width as usize);
     let height = fft_len(hay.height as usize);
     let length = width * height;
@@ -334,47 +345,70 @@ fn cross_correlation(
         row: planner.plan_fft_inverse(width),
         column: planner.plan_fft_inverse(height),
     };
+    let scratch_len = forward
+        .row
+        .get_inplace_scratch_len()
+        .max(forward.column.get_inplace_scratch_len())
+        .max(inverse.row.get_inplace_scratch_len())
+        .max(inverse.column.get_inplace_scratch_len());
+    let mut scratch = vec![Complex::default(); scratch_len];
+    let mut column = vec![Complex::default(); height];
     let mut image = vec![Complex::default(); length];
     let mut filter = vec![Complex::default(); length];
-    let mut result = vec![Complex::default(); length];
-    for channel in 0..template.channels {
+    let mut result = if active_channels.len() > 1 {
+        Some(vec![Complex::default(); length])
+    } else {
+        None
+    };
+    let hay_stride = hay.width as usize * 3;
+    let gray = template.channels == 1;
+    for (pass, &channel) in active_channels.iter().enumerate() {
         check()?;
-        if template.centered[channel].iter().all(|v| v.abs() <= 1e-12) {
-            continue;
+        if pass > 0 {
+            image.fill(Complex::default());
+            filter.fill(Complex::default());
         }
-        image.fill(Complex::default());
-        filter.fill(Complex::default());
         for y in 0..hay.height as usize {
-            for x in 0..hay.width as usize {
-                image[y * width + x].re = value(
-                    hay,
-                    y * hay.width as usize + x,
-                    channel,
-                    template.channels == 1,
-                );
+            let row_start = y * hay_stride;
+            let row = &hay.pixels[row_start..row_start + hay_stride];
+            let dst = &mut image[y * width..y * width + hay.width as usize];
+            for (slot, p) in dst.iter_mut().zip(row.as_chunks::<3>().0.iter()) {
+                slot.re = f64::from(if gray { luma(p) } else { p[channel] });
             }
         }
         for y in 0..needle.height as usize {
-            for x in 0..needle.width as usize {
-                filter[y * width + x].re =
-                    template.centered[channel][y * needle.width as usize + x];
+            let src_start = y * needle.width as usize;
+            let src = &template.centered[channel][src_start..src_start + needle.width as usize];
+            let dst = &mut filter[y * width..y * width + needle.width as usize];
+            for (slot, &val) in dst.iter_mut().zip(src) {
+                slot.re = val;
             }
         }
-        forward.run(&mut image, check)?;
-        forward.run(&mut filter, check)?;
-        for i in 0..length {
-            result[i] += image[i] * filter[i].conj();
+        forward.run(&mut image, &mut scratch, &mut column, check)?;
+        forward.run(&mut filter, &mut scratch, &mut column, check)?;
+        if let Some(acc) = result.as_mut() {
+            for i in 0..length {
+                acc[i] += image[i] * filter[i].conj();
+            }
+        } else {
+            for i in 0..length {
+                image[i] *= filter[i].conj();
+            }
         }
     }
-    drop(image);
     drop(filter);
-    inverse.run(&mut result, check)?;
-    let columns = (hay.width - needle.width + 1) as usize;
-    let rows = (hay.height - needle.height + 1) as usize;
+    let output_buf = if let Some(mut acc) = result {
+        drop(image);
+        inverse.run(&mut acc, &mut scratch, &mut column, check)?;
+        acc
+    } else {
+        inverse.run(&mut image, &mut scratch, &mut column, check)?;
+        image
+    };
     let mut output = Vec::with_capacity(columns * rows);
     for y in 0..rows {
         for x in 0..columns {
-            output.push(result[y * width + x].re / length as f64);
+            output.push(output_buf[y * width + x].re / length as f64);
         }
     }
     Ok(output)

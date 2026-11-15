@@ -8,6 +8,9 @@ pub trait Backend {
     fn move_mouse_desktop(&mut self, p: Point) -> Result<()> {
         self.move_mouse(p)
     }
+    fn move_mouse_desktop_in(&mut self, p: Point, _virtual_bounds: Rect) -> Result<()> {
+        self.move_mouse_desktop(p)
+    }
     fn button(&mut self, b: MouseButton, down: bool) -> Result<()>;
     fn scroll(&mut self, dy: i32, dx: i32) -> Result<()>;
     fn key(&mut self, key: &str, down: bool) -> Result<()>;
@@ -149,6 +152,22 @@ impl OsBackend {
 }
 
 #[cfg(feature = "os")]
+pub(crate) fn rgba_to_rgb(width: u32, height: u32, rgba: &[u8]) -> Result<Screenshot> {
+    let expected = usize::try_from(u64::from(width) * u64::from(height) * 4)
+        .map_err(|_| Error::InvalidArgument("screenshot size overflow"))?;
+    if rgba.len() != expected {
+        return Err(Error::Screenshot(
+            "unexpected RGBA capture buffer size".into(),
+        ));
+    }
+    let mut rgb = Vec::with_capacity((expected / 4) * 3);
+    for px in rgba.as_chunks::<4>().0 {
+        rgb.extend_from_slice(&[px[0], px[1], px[2]]);
+    }
+    Screenshot::new(width, height, rgb)
+}
+
+#[cfg(feature = "os")]
 impl Backend for OsBackend {
     fn move_mouse_desktop(&mut self, p: Point) -> Result<()> {
         #[cfg(windows)]
@@ -158,6 +177,19 @@ impl Backend for OsBackend {
         #[cfg(not(windows))]
         {
             let _ = p;
+            Err(Error::UnsupportedPlatform)
+        }
+    }
+
+    fn move_mouse_desktop_in(&mut self, p: Point, virtual_bounds: Rect) -> Result<()> {
+        #[cfg(windows)]
+        {
+            let _dpi = crate::dpi::DpiGuard::enter()?;
+            crate::display::send_mouse_abs(p, virtual_bounds, true)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = (p, virtual_bounds);
             Err(Error::UnsupportedPlatform)
         }
     }
@@ -178,33 +210,35 @@ impl Backend for OsBackend {
     }
 
     fn move_mouse(&mut self, p: Point) -> Result<()> {
-        use enigo::{Coordinate, Mouse};
-
-        let _dpi = crate::dpi::DpiGuard::enter()?;
-        let trace =
-            std::env::var_os("RSGUI_POINTER_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"));
-        let dimensions = trace.then(|| self.enigo.main_display());
-        let moved = self
-            .enigo
-            .move_mouse(p.x, p.y, Coordinate::Abs)
-            .map_err(|error| Error::Input(error.to_string()));
         #[cfg(windows)]
-        if trace {
-            let mut physical = windows_sys::Win32::Foundation::POINT::default();
-            let physical_ok = unsafe {
-                windows_sys::Win32::UI::WindowsAndMessaging::GetPhysicalCursorPos(&mut physical)
-            };
-            eprintln!(
-                "POINTER_INJECTION expected={p:?} dimensions={dimensions:?} queued={} after_move={:?} physical_ok={physical_ok} physical=({}, {})",
-                moved.is_ok(),
-                crate::dpi::cursor_position(),
-                physical.x,
-                physical.y
-            );
+        {
+            let _dpi = crate::dpi::DpiGuard::enter()?;
+            let trace = std::env::var_os("RSGUI_POINTER_TRACE").as_deref()
+                == Some(std::ffi::OsStr::new("1"));
+            let bounds = crate::display::virtual_desktop_bounds()?;
+            let moved = crate::display::send_mouse_abs(p, bounds, false);
+            if trace {
+                let mut physical = windows_sys::Win32::Foundation::POINT::default();
+                let physical_ok = unsafe {
+                    windows_sys::Win32::UI::WindowsAndMessaging::GetPhysicalCursorPos(&mut physical)
+                };
+                eprintln!(
+                    "POINTER_INJECTION expected={p:?} virtual_bounds={bounds:?} queued={} after_move={:?} physical_ok={physical_ok} physical=({}, {})",
+                    moved.is_ok(),
+                    crate::dpi::cursor_position_in_dpi(),
+                    physical.x,
+                    physical.y
+                );
+            }
+            moved
         }
         #[cfg(not(windows))]
-        let _ = dimensions;
-        moved
+        {
+            use enigo::{Coordinate, Mouse};
+            self.enigo
+                .move_mouse(p.x, p.y, Coordinate::Abs)
+                .map_err(|error| Error::Input(error.to_string()))
+        }
     }
 
     fn button(&mut self, button: MouseButton, down: bool) -> Result<()> {
@@ -312,8 +346,7 @@ impl Backend for OsBackend {
         }
         .map_err(|error| Error::Screenshot(error.to_string()))?;
         let (width, height) = (image.width(), image.height());
-        let rgb = image::DynamicImage::ImageRgba8(image).to_rgb8();
-        Screenshot::new(width, height, rgb.into_raw())
+        rgba_to_rgb(width, height, image.as_raw())
     }
 }
 
@@ -350,6 +383,7 @@ fn enigo_key(name: &str) -> Result<enigo::Key> {
         "numlock" => Key::Numlock,
         "scrolllock" => Key::Other(0x91),
         "printscreen" => Key::PrintScr,
+        "insert" => Key::Insert,
         "pause" => Key::Pause,
         "volumedown" => Key::VolumeDown,
         "volumeup" => Key::VolumeUp,
@@ -412,4 +446,81 @@ fn enigo_key(name: &str) -> Result<enigo::Key> {
         _ => return Err(Error::InvalidArgument("unknown key")),
     };
     Ok(key)
+}
+
+#[cfg(all(test, feature = "os"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn enigo_key_supports_all_known_key_names() {
+        let mut names: Vec<String> = vec![
+            "enter",
+            "return",
+            "tab",
+            "space",
+            "backspace",
+            "delete",
+            "esc",
+            "escape",
+            "up",
+            "down",
+            "left",
+            "right",
+            "home",
+            "end",
+            "pageup",
+            "pgup",
+            "pagedown",
+            "pgdn",
+            "shift",
+            "shiftright",
+            "ctrl",
+            "control",
+            "ctrlright",
+            "alt",
+            "option",
+            "altright",
+            "cmd",
+            "command",
+            "win",
+            "windows",
+            "meta",
+            "super",
+            "capslock",
+            "numlock",
+            "scrolllock",
+            "printscreen",
+            "insert",
+            "pause",
+            "sleep",
+            "volumedown",
+            "volumeup",
+            "volumemute",
+            "a",
+            "z",
+            "0",
+            "9",
+            "-",
+            "=",
+            "!",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        for f in 1..=24 {
+            names.push(format!("f{f}"));
+        }
+        for name in names {
+            let norm = crate::keys::normalize(&name).expect(&name);
+            assert!(enigo_key(&norm).is_ok(), "missing enigo mapping for {norm}");
+        }
+    }
+
+    #[test]
+    fn rgba_to_rgb_strips_alpha_and_checks_length() {
+        let shot = rgba_to_rgb(2, 1, &[10, 20, 30, 255, 40, 50, 60, 128]).unwrap();
+        assert_eq!(shot.pixels, vec![10, 20, 30, 40, 50, 60]);
+        assert!(rgba_to_rgb(2, 1, &[1, 2, 3, 4]).is_err());
+    }
 }
