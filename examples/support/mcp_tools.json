@@ -1,0 +1,507 @@
+[
+  {
+    "name": "session_status",
+    "description": "Read-only readiness check for unattended or monitor-less automation: Windows session id/console/remote state, lock, input desktop, cursor access, active displays and a small primary-monitor capture probe. Returns ready=false with blocker codes and advice (e.g. no-active-display -> optional virtual display driver; session-not-active -> RDP was disconnected). Never unlocks, reconnects or changes settings.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "displays_list",
+    "description": "Enumerate active Windows displays, including IDD virtual monitors. Returns connection-scoped display references, device names and physical desktop bounds. Re-list invalidates old display references. Does not install or enable a driver.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "display_capture",
+    "description": "Capture a real PNG from a selected physical or IDD virtual display without activating a window. Default is the full display. A supplied region uses global desktop physical pixels and must fit entirely inside it; at most 16 megapixels.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "display": {
+          "type": "string",
+          "description": "Fresh display reference from displays_list."
+        },
+        "region": {
+          "type": "object",
+          "properties": {
+            "left": {
+              "type": "integer"
+            },
+            "top": {
+              "type": "integer"
+            },
+            "width": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "height": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "required": [
+            "left",
+            "top",
+            "width",
+            "height"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "display"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "window_to_display",
+    "description": "Restore a minimized/maximized target, then move it 16 pixels inside a selected display and shrink it if needed. Uses real Win32 actions; returns previous and current geometry. Partial changes may remain if the app rejects resizing. Shared Windows focus/cursor; not a separate session.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Fresh window target from windows_list."
+        },
+        "display": {
+          "type": "string",
+          "description": "Fresh display reference from displays_list."
+        }
+      },
+      "required": [
+        "target",
+        "display"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "windows_list",
+    "description": "Enumerate visible Win32 windows, optionally filter titles case-insensitively. Returns scoped target references; invalidates previous references.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "title": {
+          "type": "string",
+          "description": "Optional title substring"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "window_control",
+    "description": "Direct Win32 window state/geometry control. Close posts WM_CLOSE, which may prompt to save; no force kill. All actions validate original HWND/process/thread identity.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Session target from the latest windows_list. Re-list invalidates previous targets."
+        },
+        "action": {
+          "type": "string",
+          "enum": [
+            "inspect",
+            "activate",
+            "minimize",
+            "maximize",
+            "restore",
+            "show",
+            "hide",
+            "move",
+            "resize",
+            "close"
+          ]
+        },
+        "x": {
+          "type": "integer"
+        },
+        "y": {
+          "type": "integer"
+        },
+        "width": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "height": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "target",
+        "action"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "capture",
+    "description": "Activate target and return its visible region on the selected display (default primary). PNG metadata uses Windows desktop physical pixels. Not offscreen rendering. Returns capture_id for one click_at/scroll within 60 seconds; coordinates for those tools are relative to this image. New captures and other tool calls (except session_status) invalidate it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Session target from the latest windows_list. Re-list invalidates previous targets."
+        },
+        "display": {
+          "type": "string",
+          "description": "Display reference from the latest displays_list in this connection; re-list after topology changes. Omit to use the primary monitor."
+        }
+      },
+      "required": [
+        "target"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "locate",
+    "description": "Activate target and find one template in its visible selected-display region (default primary). Returns desktop physical coordinates, possibly negative. Multiple/no matches fail. Exact and confidence are mutually exclusive.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Session target from the latest windows_list. Re-list invalidates previous targets."
+        },
+        "template": {
+          "type": "string",
+          "description": "Absolute local template image path"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.95
+        },
+        "exact": {
+          "type": "boolean",
+          "default": false
+        },
+        "timeout": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 30,
+          "default": 5
+        },
+        "scale": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 4,
+          "default": 1
+        },
+        "display": {
+          "type": "string",
+          "description": "Display reference from the latest displays_list in this connection; re-list after topology changes. Omit to use the primary monitor."
+        }
+      },
+      "required": [
+        "target",
+        "template"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "click_image",
+    "description": "Recognize one image then recheck pixels, foreground and geometry before sending a real click. Inspect capture first; template must be distinctive.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Session target from the latest windows_list. Re-list invalidates previous targets."
+        },
+        "template": {
+          "type": "string",
+          "description": "Absolute local template image path"
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.95
+        },
+        "exact": {
+          "type": "boolean",
+          "default": false
+        },
+        "timeout": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 30,
+          "default": 5
+        },
+        "scale": {
+          "type": "number",
+          "minimum": 0.1,
+          "maximum": 4,
+          "default": 1
+        },
+        "display": {
+          "type": "string",
+          "description": "Display reference from the latest displays_list in this connection; re-list after topology changes. Omit to use the primary monitor."
+        }
+      },
+      "required": [
+        "target",
+        "template"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "click_at",
+    "description": "Send one real left click using a single-use window capture proof. Checks target identity, foreground, bounds, display, cursor, cancellation and exact pixels in a clipped 32x32 patch before input. Does not activate a lost-focus window. Every attempt consumes the proof. Hover/animation changes may require a fresh capture with the cursor positioned. Changes outside the patch and changes after the final check are not detected. Capture again to verify the result.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Same target as the latest window capture."
+        },
+        "capture_id": {
+          "type": "string",
+          "description": "Unused capture_id returned by capture in this connection, valid for 60 seconds."
+        },
+        "x": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Horizontal pixel in the captured PNG, relative to its left edge."
+        },
+        "y": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Vertical pixel in the captured PNG, relative to its top edge."
+        }
+      },
+      "required": [
+        "target",
+        "capture_id",
+        "x",
+        "y"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "scroll",
+    "description": "Send wheel input at the observed image point using a single-use window capture proof. Checks target identity, foreground, bounds, display, cursor, cancellation and exact pixels in a clipped 32x32 patch before input. Does not activate a lost-focus window. Every attempt consumes the proof. Hover/animation changes may require a fresh capture with the cursor positioned. Changes outside the patch and changes after the final check are not detected. Capture again to verify the result.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Same target as the latest window capture."
+        },
+        "capture_id": {
+          "type": "string",
+          "description": "Unused capture_id returned by capture in this connection, valid for 60 seconds."
+        },
+        "x": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Horizontal pixel in the captured PNG, relative to its left edge."
+        },
+        "y": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Vertical pixel in the captured PNG, relative to its top edge."
+        },
+        "clicks": {
+          "type": "integer",
+          "minimum": -100,
+          "maximum": 100,
+          "description": "Nonzero wheel steps: positive up, negative down; horizontal positive right, negative left."
+        },
+        "horizontal": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "target",
+        "capture_id",
+        "x",
+        "y",
+        "clicks"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "type_text",
+    "description": "Activate target and send Unicode text to the focused control, in batches of at most 32 Unicode scalar values. Rechecks foreground and cancellation before every batch; preserves per-character fail-safe checks. Partial text (up to one batch after focus changes) may be sent before cancellation/failure.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Session target from the latest windows_list. Re-list invalidates previous targets."
+        },
+        "text": {
+          "type": "string",
+          "description": "Text to enter; no shell evaluation",
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "target",
+        "text"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "hotkey",
+    "description": "Activate target and send a chord, releasing all keys afterwards (e.g. [ctrl,a] or [enter]). Verify the focused control before input.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "target": {
+          "type": "string",
+          "description": "Session target from the latest windows_list. Re-list invalidates previous targets."
+        },
+        "keys": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "minItems": 1,
+          "maxItems": 8
+        }
+      },
+      "required": [
+        "target",
+        "keys"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "screensaver",
+    "description": "Read screensaver status, pause auto-start, resume or stop an active .scr saver. Pause restores on timer, resume or MCP disconnection. Does not unlock Windows or change password/lock policy.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "action": {
+          "type": "string",
+          "enum": [
+            "status",
+            "pause",
+            "resume",
+            "stop"
+          ]
+        },
+        "seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 86400,
+          "default": 900
+        }
+      },
+      "required": [
+        "action"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  }
+]

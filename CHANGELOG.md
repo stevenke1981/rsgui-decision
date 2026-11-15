@@ -1,0 +1,46 @@
+# Changelog
+
+## Unreleased
+
+- Fixed installation with existing empty/whitespace MCP JSON while preserving byte-exact uninstall backups. Antigravity skills now default to the shared `.gemini/config/skills`; `-AgySkillRoot` supports legacy/custom locations.
+- Fixed restore timing out when a minimized window returns to its previous maximized state; move/resize and display placement still explicitly normalize the window first.
+- Added MCP `click_at` and vertical/horizontal `scroll`, bound to the latest single-use window capture for 60 seconds. Input checks target identity, foreground, geometry, display, cursor and a local pixel patch before dispatch; invalid attempts also consume the proof.
+- Batched MCP `type_text` into at most 32 Unicode scalar values per foreground/cancellation check, retaining library fail-safe checks and the configured pause per batch. Clipboard paste and UI Automation remain outside this change.
+
+- Added unattended/monitor-less readiness diagnostics: CLI `session status [--json]` (non-zero exit on blockers) and read-only MCP `session_status`. Reports session/console/RDP state, lock, input desktop, cursor access, active displays and a primary-monitor capture probe, with blocker codes such as `no-active-display`, `remote-not-rendering`, `session-not-active`, `locked` and `service-session`. Decision logic is unit-tested on all platforms.
+- Added `scripts/rdp-to-console.ps1` (administrator, `-WhatIf`/confirmation) to move an RDP session to the console with `tscon` so the desktop keeps rendering after disconnect, plus `docs/headless.md`.
+
+- Added explicit Windows display snapshots, real display/region PNG capture, display-targeted recognition/clicking with virtual-desktop SendInput coordinates, and Win32 window placement on physical or IDD virtual monitors. Existing primary-monitor defaults and corner fail-safe remain.
+- Added three MCP tools (`displays_list`, `display_capture`, `window_to_display`), optional display references for capture/locate/click_image, CLI display commands, and updated Skills. Display identity/geometry is revalidated and stale references are rejected.
+- Added an optional pinned VDD/NefCon preparation and administrator installation helper with ZIP hashes, signature checks, one-monitor configuration and owned-device recovery records. Driver downloads/installations are separate from the lazy Rust EXE/DLL and are never triggered by MCP.
+
+- Added a small Windows launcher with an on-demand `autogui_runtime.dll`; help and MCP negotiation/listing run without loading the DLL. Kept all image codecs and library APIs. Release uses size optimization, Thin LTO and symbol stripping while recognition/FFT retain opt-level 3 and unwind cleanup remains enabled.
+- Added stdio MCP with eight tools, session window references, PNG image content, checked input, cooperative cancellation and per-connection screensaver pause leases restored on disconnect.
+- Exposed Win32 inspect/activate/move/resize/minimize/maximize/restore/hide/show/close in CLI and MCP, including honest WM_CLOSE request semantics.
+- Added a bundled `autogui-control` Skill, selectable Codex/Claude/OpenCode/AGY Skill and MCP installation, JSONC-preserving edits, per-file manifests/backups and conservative uninstall/rollback. Added isolated installer, lazy DLL/protocol, and native MCP fixture coverage.
+
+- Added Windows CLI `screensaver status/pause/resume/stop`, configurable pause duration, Ctrl+C/timer/manual restoration, per-logon crash recovery and concurrent-pause protection. No password, timeout or persistent screen-lock setting changes.
+- Screensaver commands execute before the input backend is initialized. Stop verifies `.scr` process identity on the dedicated desktop and confirms shutdown; pause reports Windows power/lock transition errors and restores prior state on failure.
+- Completed native screen-recognition, click, Unicode input and CLI acceptance after dismissing the screen saver. The disposable classic EDIT fixture now owns its Ctrl+A accelerator; its packed accelerator buffer is explicitly DWORD-aligned for Win32.
+
+- Fixed grayscale arithmetic overflow and false positives on constant-color templates; confidence search now uses per-channel normalization, integer integral images, FFT candidate search and direct candidate verification.
+- Replaced quadratic overlap suppression with spatial buckets, and capture only the requested region during screen searches while preserving absolute coordinates.
+- Added cooperative fail-safe checks during recognition, drag and repeated input; key/button cleanup still runs at fail-safe corners. `KeyHold` now permits operations through its guard.
+- Added scoped physical-pixel DPI handling on Windows, process/thread identity validation for window handles, current-title reads, asynchronous window state requests and state/foreground confirmation.
+- Added `app_control` with window/title disambiguation, image revalidation, explicit template scaling, window capture and guarded input. Non-OS builds refuse to operate the CLI.
+- Added recognition benchmarks and an ignored native fixture test covering real clicks, Unicode input and CLI operations. Interactive execution is subject to an unlocked Windows desktop.
+
+- `AutoGui::new()` now uses real desktop input through Enigo and primary-monitor capture through XCap; `with_fake` remains for tests.
+- Added common image-file loading/saving, including PNG and JPEG, for `Screenshot` and screen locate APIs.
+- Implemented normalized cross-correlation for confidence matching behind the `opencv` feature flag.
+- Tightened input release handling, screen-region clipping, fail-safe checks after screen reads, and Win32 window validation.
+- Reworked the cheat-sheet example and documentation to avoid sending real input when copied or run.
+
+## 0.1.0
+
+- AutoGui instance API: mouse, keyboard, fail-safe, pause, tweens
+- FakeBackend for deterministic tests
+- Exact template locate on RGB buffers and common raster image files
+- Optional normalized cross-correlation matching via the `opencv` feature flag
+- Window API: full Win32 module behind `cfg(windows)`; other OS return UnsupportedPlatform
+- Examples: cheat_sheet (read-only), spiral_drag (warns before moving)
