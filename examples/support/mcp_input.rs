@@ -3,6 +3,7 @@ use super::{active, capture_region, screen_region};
 use autogui::{AutoGui, Display, Error, Point, Rect, Result, Screenshot, Window};
 use std::time::{Duration, Instant};
 
+#[derive(Clone)]
 pub(super) struct CaptureProof {
     pub id: String,
     pub target: String,

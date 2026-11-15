@@ -181,9 +181,30 @@ impl Backend for OsBackend {
         use enigo::{Coordinate, Mouse};
 
         let _dpi = crate::dpi::DpiGuard::enter()?;
-        self.enigo
+        let trace =
+            std::env::var_os("RSGUI_POINTER_TRACE").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let dimensions = trace.then(|| self.enigo.main_display());
+        let moved = self
+            .enigo
             .move_mouse(p.x, p.y, Coordinate::Abs)
-            .map_err(|error| Error::Input(error.to_string()))
+            .map_err(|error| Error::Input(error.to_string()));
+        #[cfg(windows)]
+        if trace {
+            let mut physical = windows_sys::Win32::Foundation::POINT::default();
+            let physical_ok = unsafe {
+                windows_sys::Win32::UI::WindowsAndMessaging::GetPhysicalCursorPos(&mut physical)
+            };
+            eprintln!(
+                "POINTER_INJECTION expected={p:?} dimensions={dimensions:?} queued={} after_move={:?} physical_ok={physical_ok} physical=({}, {})",
+                moved.is_ok(),
+                crate::dpi::cursor_position(),
+                physical.x,
+                physical.y
+            );
+        }
+        #[cfg(not(windows))]
+        let _ = dimensions;
+        moved
     }
 
     fn button(&mut self, button: MouseButton, down: bool) -> Result<()> {

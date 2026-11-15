@@ -5,15 +5,15 @@ edition = "2024"
 license = "MIT"
 description = "PyAutoGUI-compatible desktop automation in Rust"
 readme = "README.md"
-repository = "https://github.com/urtiger101-tw/rsautogui"
+repository = "https://github.com/stevenke1981/rsgui-decision"
 
 [workspace]
-members = ["runtime", "launcher"]
+members = ["runtime", "launcher", "decision"]
 resolver = "3"
 
 [features]
 default = ["locate", "os"]
-agent = ["dep:serde", "dep:serde_json", "dep:base64"]
+agent = ["dep:serde", "dep:serde_json", "dep:base64", "dep:rsgui-decision-core"]
 locate = []
 opencv = ["dep:rustfft"]
 os = ["dep:enigo"]
@@ -25,6 +25,7 @@ serde = { version = "1", features = ["derive"], optional = true }
 serde_json = { version = "1", optional = true }
 base64 = { version = "0.22", optional = true }
 thiserror = "2.0.18"
+rsgui-decision-core = { path = "decision", optional = true }
 rustfft = { version = "6.4.1", optional = true }
 xcap = "0.9.8"
 

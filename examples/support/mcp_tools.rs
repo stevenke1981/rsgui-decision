@@ -3,6 +3,8 @@ use super::{
     session, window_command,
 };
 use autogui::{AutoGui, Display, Error, LocateOptions, Rect, Result, Screenshot, Window};
+#[path = "mcp_decision.rs"]
+mod decision;
 #[path = "mcp_input.rs"]
 mod input;
 use base64::Engine;
@@ -151,6 +153,7 @@ pub(crate) struct Session {
     capture_generation: u64,
     capture: Option<CaptureProof>,
     pause: Option<PauseLease>,
+    decisions: decision::State,
 }
 
 impl Session {
@@ -190,6 +193,12 @@ impl Session {
         args: Value,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Value> {
+        if decision::NAMES.contains(&name) {
+            return self.decision_call(name, args, check);
+        }
+        if name != "session_status" {
+            self.decisions.pending = None;
+        }
         // Readiness queries preserve the proof; calls that can change focus,
         // pixels, targets or display references invalidate it even on failure.
         if !matches!(name, "click_at" | "scroll" | "session_status") {
@@ -321,7 +330,7 @@ impl Session {
                     Ok(text(info(&window)?))
                 }
             }
-            "capture" => {
+            "capture" | "observe" => {
                 let a: Target = decode(args)?;
                 let display = a
                     .display
@@ -330,7 +339,9 @@ impl Session {
                     .transpose()?;
                 let window = self.target(&a.target)?;
                 check()?;
-                window.activate()?;
+                if name == "capture" {
+                    window.activate()?;
+                }
                 active(&window)?;
                 let bounds = window.box_rect()?;
                 check()?;
@@ -405,7 +416,9 @@ impl Session {
                     gui.move_to_xy(point.x, point.y)?;
                 }
                 proof.verify(gui, &window, display.as_ref(), point, check)?;
-                if gui.position()? != point {
+                let actual = gui.position()?;
+                if actual != point {
+                    eprintln!("autogui pointer readback: expected={point:?}, actual={actual:?}");
                     return Err(Error::InvalidArgument(
                         "cursor moved before input; capture again",
                     ));
@@ -507,7 +520,7 @@ impl Session {
                     json!({"rect":rect(found),"center":{"x":point.x,"y":point.y},"clicked":name=="click_image","display":a.display,"coordinates":"windows desktop physical pixels"}),
                 ))
             }
-            "type_text" => {
+            "type_text" | "type_text_passive" => {
                 let a: TypeText = decode(args)?;
                 let count = a.text.chars().count();
                 if count > 4096 {
@@ -517,7 +530,9 @@ impl Session {
                 }
                 let window = self.target(&a.target)?;
                 check()?;
-                window.activate()?;
+                if name == "type_text" {
+                    window.activate()?;
+                }
                 type_chunks(&a.text, |chunk| {
                     check()?;
                     active(&window)?;
@@ -527,7 +542,7 @@ impl Session {
                     json!({"characters_sent":count,"note":"input sent; capture/inspect the app to confirm its result"}),
                 ))
             }
-            "hotkey" => {
+            "hotkey" | "hotkey_passive" => {
                 let a: Hotkey = decode(args)?;
                 if a.keys.is_empty()
                     || a.keys.len() > 8
@@ -539,7 +554,9 @@ impl Session {
                 }
                 let window = self.target(&a.target)?;
                 check()?;
-                window.activate()?;
+                if name == "hotkey" {
+                    window.activate()?;
+                }
                 active(&window)?;
                 check()?;
                 self.gui()?

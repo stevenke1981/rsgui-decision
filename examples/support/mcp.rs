@@ -24,9 +24,19 @@ pub(crate) const NAMES: &[&str] = &[
     "type_text",
     "hotkey",
     "screensaver",
+    "decision_observe",
+    "decision_evaluate",
+    "decision_act",
+    "decision_step",
+    "decision_status",
 ];
 pub(crate) fn definitions() -> Value {
-    serde_json::from_str(include_str!("mcp_tools.json")).expect("embedded tool schema")
+    let mut tools: Vec<Value> =
+        serde_json::from_str(include_str!("mcp_tools.json")).expect("embedded native tool schema");
+    let decision: Vec<Value> = serde_json::from_str(include_str!("decision_tools.json"))
+        .expect("embedded decision tool schema");
+    tools.extend(decision);
+    Value::Array(tools)
 }
 pub(crate) trait Handler {
     fn call(&mut self, name: &str, args: Value, check: &dyn Fn() -> Result<()>) -> Result<Value>;

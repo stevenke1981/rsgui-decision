@@ -1,0 +1,36 @@
+name: Windows Rust verification
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: cargo test --workspace --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo build --release --workspace --all-features --locked
+      - name: MCP protocol and lazy DLL loading
+        run: ./tests/mcp-protocol.ps1 -Executable ./target/release/rsgui-decision.exe
+      - name: Package and verify recoverable installation
+        shell: powershell
+        run: |
+          ./scripts/package.ps1 -SkipBuild -OutputDir ./dist/ci-package
+          ./tests/local-install.ps1 -PackageDir ./dist/ci-package
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: windows-x86_64
+          path: dist/ci-package.zip
+          if-no-files-found: error

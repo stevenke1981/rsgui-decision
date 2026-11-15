@@ -2,6 +2,9 @@
 
 use autogui::{AutoGui, Error, LocateOptions, Point, Rect};
 #[cfg(feature = "agent")]
+#[path = "support/decision_live.rs"]
+mod decision_live;
+#[cfg(feature = "agent")]
 #[path = "support/mcp_client.rs"]
 mod mcp_client;
 use std::sync::{

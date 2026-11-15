@@ -17,7 +17,7 @@ Owner: root implementer. Requested by the owner on 2026-11-15.
   observations and real input on a test-owned Windows fixture.
 - Compare the current persistent MCP path and integrated path on the same host;
   disclose timings and invocation counts without promising a speed multiplier.
-- Commit, push a PR to a new private stevenke1981/rsgui-decision repository,
+- Commit, push a PR to stevenke1981/rsgui-decision (public as requested on 2026-11-16),
   independently review, pass CI, merge main, release and replace the identified
   local installation with a checked, recoverable artifact.
 
@@ -48,8 +48,8 @@ Plan -> native integration and isolated core implementation -> local verificatio
   `e724a3bee6dec9d91635c3798400e96b4f0a5e85`, MIT.
 - The optional Gemini share returned an application shell without the shared
   conversation; its design contents are NOT_RUN, not used as evidence.
-- Installed Agent Team Workflow 1.0.0 is available under the current steven
-  profile. The referenced eda verification kit/router is absent; use the actual
+- Installed Agent Team Workflow 1.0.0 is available in the host skill catalog.
+  The optional external verification kit/router was unavailable; use the actual
   project's Cargo checks and fresh command evidence without claiming that kit ran.
 
 ## Advisory decisions
