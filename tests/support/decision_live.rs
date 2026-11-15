@@ -33,7 +33,19 @@ fn integrated_decision_native_fixture() {
     let title = format!("rsgui decision fixture {}", std::process::id());
     let fixture = Fixture::open(&title, pointer);
     let window = gui.get_windows_with_title(&title).unwrap().remove(0);
-    window.activate().unwrap();
+    if let Err(error) = window.activate() {
+        eprintln!(
+            "WAIT_FOR_FIXTURE_FOCUS {title}: {error}; foreground only this test-owned window through the supported desktop surface"
+        );
+        let waiting = Instant::now();
+        while !window.is_active().unwrap() {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(60),
+                "test fixture needs explicit foreground activation; no focus restrictions were changed"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
     let button = autogui::center(native_rect(fixture.handles.button));
     gui.move_to_xy(button.x, button.y).unwrap();
     let mut client = mcp_client::Client::start(&executable);

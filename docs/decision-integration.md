@@ -93,6 +93,9 @@ cargo fmt --all -- --check
 
 Live tests are ignored by default. Run only against the test-owned fixture with
 an unlocked rendered desktop; do not run against a user's application:
+If Windows denies foreground activation, the test waits up to 60 seconds for
+explicit activation of its own fixture window. It never changes foreground-lock
+settings or attempts to bypass them.
 
 ```powershell
 $env:AUTOGUI_LIVE='1'
@@ -106,4 +109,10 @@ smokes both loaders, preserves old files and outputs a recovery manifest.
 Use `restore-local.ps1 -Manifest <that-path>` to restore that exact transaction;
 changed destination files are protected. Host approval policies, browser URL
 verification, accounts, MCP configuration and PATH are outside this installer.
-Do not replace a running/locked executable or DLL. These artifacts are unsigned.
+The default upgrade refuses running/locked files. After verifying the package,
+`-AllowInUseRename` may preserve running old images by moving them into the
+transaction's displaced directory before placing new files at their original
+paths. Old processes keep their old code/tools until restarted; new processes
+use the new pair. This does not disconnect existing MCP sessions. Restore still
+requires new processes to exit before replacing their mapped files. These
+artifacts are unsigned.
