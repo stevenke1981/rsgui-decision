@@ -6,7 +6,11 @@ param(
     [string]$PreviousBinariesDir
 )
 $ErrorActionPreference = 'Stop'
-$PackageDir = [IO.Path]::GetFullPath($PackageDir)
+function FullPath([string]$Path) {
+    if ([IO.Path]::IsPathRooted($Path)) { [IO.Path]::GetFullPath($Path) }
+    else { [IO.Path]::GetFullPath((Join-Path (Get-Location -PSProvider FileSystem).ProviderPath $Path)) }
+}
+$PackageDir = FullPath $PackageDir
 $repo = Split-Path -Parent $PSScriptRoot
 $installer = Join-Path $repo 'scripts\install-local.ps1'
 $restore = Join-Path $repo 'scripts\restore-local.ps1'
@@ -39,6 +43,7 @@ function StartOwnMcp([string]$Path) {
     $start.FileName=$Path; $start.Arguments='mcp'; $start.UseShellExecute=$false; $start.CreateNoWindow=$true
     $start.RedirectStandardInput=$true; $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
     $start.StandardOutputEncoding=[Text.Encoding]::UTF8; $start.StandardErrorEncoding=[Text.Encoding]::UTF8
+    $start.EnvironmentVariables['RSGUI_DECISION_MODE']='local'
     $process=New-Object Diagnostics.Process; $process.StartInfo=$start
     $inputEncoding=[Console]::InputEncoding
     try { [Console]::InputEncoding=New-Object Text.UTF8Encoding($false); [void]$process.Start() }
@@ -179,7 +184,30 @@ try {
     MustFail { & $installer -PackageDir $incomplete -InstallDir $rejectedInstall -BinDir (Join-Path $fixture 'rejected bin') } 'Missing mandatory package file'
     Assert (-not (Test-Path -LiteralPath $rejectedInstall)) 'Incomplete package created target directories'
 
-    $oldSource = if ($PreviousBinariesDir) { [IO.Path]::GetFullPath($PreviousBinariesDir) } else { $PackageDir }
+    $badProbe = Join-Path $fixture 'bad probe package'
+    New-Item -ItemType Directory -Path $badProbe | Out-Null
+    $badEntries = @()
+    foreach ($name in @('autogui-control.exe','rsgui-decision.exe','autogui_runtime.dll')) {
+        $target = Join-Path $badProbe $name
+        if ($name -eq 'autogui-control.exe') { WriteUtf8 $target 'not a valid executable' }
+        else { Copy-Item -LiteralPath (Join-Path $PackageDir $name) -Destination $target }
+        $badEntries += @{path=$name;sha256=(Hash $target);bytes=(Get-Item -LiteralPath $target).Length}
+    }
+    $badPayloadPath = Join-Path $badProbe 'payload.json'
+    WriteUtf8 $badPayloadPath (@{version=1;files=$badEntries} | ConvertTo-Json -Depth 5)
+    $badSums = @($badEntries | ForEach-Object { "$($_.sha256)  $($_.path)" })
+    $badSums += "$(Hash $badPayloadPath)  payload.json"
+    [IO.File]::WriteAllLines((Join-Path $badProbe 'SHA256SUMS.txt'),$badSums,$utf8)
+    MustFail { & $installer -PackageDir $badProbe -InstallDir $rejectedInstall -BinDir (Join-Path $fixture 'rejected bin') } 'autogui-control\.exe'
+    Assert (-not (Test-Path -LiteralPath $rejectedInstall)) 'Probe-failing package retained newly created target directories'
+    $probeExistingInstall = Join-Path $fixture 'probe existing install'
+    New-Item -ItemType Directory -Path $probeExistingInstall | Out-Null
+    WriteUtf8 (Join-Path $probeExistingInstall 'keep.txt') 'keep'
+    MustFail { & $installer -PackageDir $badProbe -InstallDir $probeExistingInstall -BinDir (Join-Path $fixture 'rejected bin') } 'autogui-control\.exe'
+    Assert (-not (Test-Path -LiteralPath (Join-Path $probeExistingInstall '.local-replacements'))) 'Probe-failing package left .local-replacements behind'
+    Assert ([IO.File]::ReadAllText((Join-Path $probeExistingInstall 'keep.txt'),[Text.Encoding]::UTF8) -ceq 'keep') 'Probe-failing package altered existing install directory'
+
+    $oldSource = if ($PreviousBinariesDir) { FullPath $PreviousBinariesDir } else { $PackageDir }
     $runningInstall = Join-Path $fixture 'running old program'
     $runningBin = Join-Path $fixture 'running new bin'
     New-Item -ItemType Directory -Path $runningInstall | Out-Null
@@ -224,6 +252,7 @@ try {
         Assert ($newVersion -eq $runningData.loader_version) 'New process version mismatch'
         Assert (@((Request $newClient 'tools/list' @{}).result.tools).Count -eq 19) 'New process did not expose 19 tools'
         Assert (-not (Request $newClient 'tools/call' @{name='session_status';arguments=@{}}).result.isError) 'New runtime call failed'
+        Assert (-not (Request $newClient 'tools/call' @{name='decision_status';arguments=@{}}).result.isError) 'New decision_status call failed'
         MustFail { & $restore -Manifest $runningManifest } 'Exit processes using the newly installed file'
         StopOwnMcp $newClient; $newClient=$null
         & $restore -Manifest $runningManifest

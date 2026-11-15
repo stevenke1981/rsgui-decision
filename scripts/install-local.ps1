@@ -11,7 +11,8 @@ $ErrorActionPreference = 'Stop'
 $utf8 = New-Object Text.UTF8Encoding($false)
 
 function FullPath([string]$Path) {
-    $full = [IO.Path]::GetFullPath($Path)
+    $base = (Get-Location -PSProvider FileSystem).ProviderPath
+    $full = if ([IO.Path]::IsPathRooted($Path)) { [IO.Path]::GetFullPath($Path) } else { [IO.Path]::GetFullPath((Join-Path $base $Path)) }
     if ($full.Length -gt [IO.Path]::GetPathRoot($full).Length) { $full = $full.TrimEnd('\') }
     $full
 }
@@ -54,6 +55,7 @@ function StartProbe([string]$Path, [string]$Arguments) {
     $start.RedirectStandardError = $true
     $start.StandardOutputEncoding = [Text.Encoding]::UTF8
     $start.StandardErrorEncoding = [Text.Encoding]::UTF8
+    $start.EnvironmentVariables['RSGUI_DECISION_MODE'] = 'local'
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $start
     # .NET Framework creates stdin's AutoFlush writer during Start(), inheriting
@@ -62,6 +64,9 @@ function StartProbe([string]$Path, [string]$Arguments) {
     try {
         [Console]::InputEncoding = New-Object Text.UTF8Encoding($false)
         [void]$process.Start()
+    } catch {
+        $process.Dispose()
+        throw "Failed to start ${Path}: $($_.Exception.Message)"
     } finally { [Console]::InputEncoding = $inputEncoding }
     @{ Process=$process; ErrorTask=$process.StandardError.ReadToEndAsync() }
 }
@@ -82,7 +87,8 @@ function VerifyLoader([string]$Path, [switch]$Mcp) {
         }
         $requests = @(
             @{jsonrpc='2.0';id=1;method='initialize';params=@{protocolVersion='2025-11-25';capabilities=@{};clientInfo=@{name='local-install';version='1'}}},
-            @{jsonrpc='2.0';id=2;method='tools/list';params=@{}}
+            @{jsonrpc='2.0';id=2;method='tools/list';params=@{}},
+            @{jsonrpc='2.0';id=3;method='tools/call';params=@{name='decision_status';arguments=@{}}}
         )
         foreach ($request in $requests) {
             $process.StandardInput.WriteLine(($request | ConvertTo-Json -Depth 8 -Compress))
@@ -95,9 +101,17 @@ function VerifyLoader([string]$Path, [switch]$Mcp) {
                 if ($response.result.protocolVersion -ne '2025-11-25') { throw "Unexpected MCP protocol: $Path" }
                 $process.StandardInput.WriteLine('{"jsonrpc":"2.0","method":"notifications/initialized"}')
                 $process.StandardInput.Flush()
-            } else {
+            } elseif ($request.id -eq 2) {
                 $tools = @($response.result.tools)
                 if ($tools.Count -ne 19 -or @($tools.name | Sort-Object -Unique).Count -ne 19) { throw "Expected 19 unique MCP tools: $Path" }
+            } else {
+                if ($response.result.isError) { throw "MCP decision_status failed: $Path ($($response.result.content[0].text))" }
+                $statusPayload = $response.result.content[0].text | ConvertFrom-Json
+                if ($statusPayload.mode -ne 'local') { throw "Unexpected decision_status mode from ${Path}: $($statusPayload.mode)" }
+                $process.Refresh()
+                if (@($process.Modules | Where-Object { $_.ModuleName -eq 'autogui_runtime.dll' }).Count -ne 1) {
+                    throw "Runtime DLL was not loaded by decision_status: $Path"
+                }
             }
         }
         $process.StandardInput.Close()
@@ -128,11 +142,12 @@ foreach ($line in [IO.File]::ReadAllLines($sumsPath, [Text.Encoding]::UTF8)) {
 }
 $payloadHash = Hash $payloadPath
 if ($sums['payload.json'] -ne $payloadHash) { throw 'payload.json checksum mismatch' }
+$packagePrefix = $PackageDir.TrimEnd('\') + '\'
 $packageFiles = @{}
 foreach ($file in $payload.files) {
     if ([string]::IsNullOrWhiteSpace($file.path) -or [IO.Path]::IsPathRooted($file.path) -or $file.sha256 -notmatch '^[A-Fa-f0-9]{64}$' -or $file.bytes -isnot [ValueType] -or $file.bytes -lt 0) { throw 'Invalid package file entry' }
     $source = FullPath (Join-Path $PackageDir $file.path)
-    if (-not $source.StartsWith($PackageDir + '\', [StringComparison]::OrdinalIgnoreCase) -or $packageFiles.ContainsKey($source)) { throw "Invalid/duplicate payload path: $($file.path)" }
+    if (-not $source.StartsWith($packagePrefix, [StringComparison]::OrdinalIgnoreCase) -or $packageFiles.ContainsKey($source)) { throw "Invalid/duplicate payload path: $($file.path)" }
     CheckPath $source
     if (-not (Test-Path -LiteralPath $source -PathType Leaf) -or (Get-Item -LiteralPath $source).Length -ne $file.bytes -or (Hash $source) -ne $file.sha256 -or $sums[$file.path] -ne $file.sha256) { throw "Package checksum/length mismatch: $source" }
     $packageFiles[$source] = $file
@@ -148,66 +163,92 @@ $targets = @(
 $uniqueTargets = @{}
 foreach ($target in $targets) {
     $path = Join-Path $target.root $target.name
-    if ($path.StartsWith($PackageDir + '\', [StringComparison]::OrdinalIgnoreCase)) { throw "Package cannot also be an installation target: $path" }
+    if ($path.StartsWith($packagePrefix, [StringComparison]::OrdinalIgnoreCase)) { throw "Package cannot also be an installation target: $path" }
     CheckPath $path
     if (-not $AllowInUseRename) { CheckUnlocked $path }
     elseif ((Test-Path -LiteralPath $path) -and -not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Expected a file: $path" }
     $uniqueTargets[$path] = $target
 }
 
+$replacementsRoot = Join-Path $InstallDir '.local-replacements'
+CheckPath $replacementsRoot
+$existedInstallDir = Test-Path -LiteralPath $InstallDir
+$existedReplacements = Test-Path -LiteralPath $replacementsRoot
 $transactionId = (Get-Date -Format 'yyyyMMdd_HHmmss') + '_' + [guid]::NewGuid().ToString('N')
-$transactionRoot = Join-Path $InstallDir ('.local-replacements\' + $transactionId)
+$transactionRoot = Join-Path $replacementsRoot $transactionId
 CheckPath $transactionRoot
 if (Test-Path -LiteralPath $transactionRoot) { throw "Backup directory already exists: $transactionRoot" }
 $stageDir = Join-Path $transactionRoot 'stage'
 $backupDir = Join-Path $transactionRoot 'backup'
 $displacedDir = Join-Path $transactionRoot 'displaced'
 $manifestPath = Join-Path $transactionRoot 'manifest.json'
-New-Item -ItemType Directory -Path $stageDir | Out-Null
-New-Item -ItemType Directory -Path $backupDir | Out-Null
-if ($AllowInUseRename) { New-Item -ItemType Directory -Path $displacedDir | Out-Null }
-# Probe --version in isolation before placing the runtime beside either loader.
-$versions = @()
-foreach ($name in @('autogui-control.exe','rsgui-decision.exe')) {
-    $staged = Join-Path $stageDir $name
-    Copy-Item -LiteralPath (Join-Path $PackageDir $name) -Destination $staged
-    if ((Hash $staged) -ne $packageFiles[(Join-Path $PackageDir $name)].sha256) { throw "Staged checksum mismatch: $staged" }
-    $versions += VerifyLoader $staged
-}
-if ($versions[0] -ne $versions[1]) { throw 'Loader versions do not match' }
-Copy-Item -LiteralPath (Join-Path $PackageDir 'autogui_runtime.dll') -Destination (Join-Path $stageDir 'autogui_runtime.dll')
-if ((Hash (Join-Path $stageDir 'autogui_runtime.dll')) -ne $packageFiles[(Join-Path $PackageDir 'autogui_runtime.dll')].sha256) { throw 'Staged runtime checksum mismatch' }
-foreach ($name in @('autogui-control.exe','rsgui-decision.exe')) { VerifyLoader (Join-Path $stageDir $name) -Mcp }
-
+$manifestWritten = $false
 $records = @()
 $movePairs = @{}
-foreach ($path in @($uniqueTargets.Keys | Sort-Object)) {
-    if (-not $AllowInUseRename) { CheckUnlocked $path }
-    $target = $uniqueTargets[$path]
-    $existed = Test-Path -LiteralPath $path -PathType Leaf
-    $oldHash = $null
-    $backup = $null
-    $displaced = $null
-    if ($existed) {
-        $oldHash = Hash $path
-        $backup = Join-Path $backupDir ('{0:D2}.bin' -f $records.Count)
-        Copy-Item -LiteralPath $path -Destination $backup
-        if ((Hash $backup) -ne $oldHash) { throw "Backup checksum mismatch: $backup" }
-        if ($AllowInUseRename) {
-            $displaced = Join-Path $displacedDir ('{0:D2}.bin' -f $records.Count)
-            $movePairs[$path] = $displaced
-            $movePairs[$displaced] = $path
+$versions = @()
+try {
+    New-Item -ItemType Directory -Path $stageDir | Out-Null
+    New-Item -ItemType Directory -Path $backupDir | Out-Null
+    # Probe --version in isolation before placing the runtime beside either loader.
+    foreach ($name in @('autogui-control.exe','rsgui-decision.exe')) {
+        $staged = Join-Path $stageDir $name
+        Copy-Item -LiteralPath (Join-Path $PackageDir $name) -Destination $staged
+        if ((Hash $staged) -ne $packageFiles[(Join-Path $PackageDir $name)].sha256) { throw "Staged checksum mismatch: $staged" }
+        $versions += VerifyLoader $staged
+    }
+    if ($versions[0] -ne $versions[1]) { throw 'Loader versions do not match' }
+    Copy-Item -LiteralPath (Join-Path $PackageDir 'autogui_runtime.dll') -Destination (Join-Path $stageDir 'autogui_runtime.dll')
+    if ((Hash (Join-Path $stageDir 'autogui_runtime.dll')) -ne $packageFiles[(Join-Path $PackageDir 'autogui_runtime.dll')].sha256) { throw 'Staged runtime checksum mismatch' }
+    foreach ($name in @('autogui-control.exe','rsgui-decision.exe')) { VerifyLoader (Join-Path $stageDir $name) -Mcp }
+
+    $installVolume = [IO.Path]::GetPathRoot($InstallDir)
+    foreach ($path in @($uniqueTargets.Keys | Sort-Object)) {
+        if (-not $AllowInUseRename) { CheckUnlocked $path }
+        $target = $uniqueTargets[$path]
+        $existed = Test-Path -LiteralPath $path -PathType Leaf
+        $oldHash = $null
+        $backup = $null
+        $displaced = $null
+        if ($existed) {
+            $oldHash = Hash $path
+            $backup = Join-Path $backupDir ('{0:D2}.bin' -f $records.Count)
+            Copy-Item -LiteralPath $path -Destination $backup
+            if ((Hash $backup) -ne $oldHash) { throw "Backup checksum mismatch: $backup" }
+            if ($AllowInUseRename) {
+                $sameVolume = [String]::Equals([IO.Path]::GetPathRoot($path), $installVolume, [StringComparison]::OrdinalIgnoreCase)
+                $targetDisplacedDir = if ($sameVolume) {
+                    $displacedDir
+                } else {
+                    Join-Path (Split-Path -Parent $path) ('.local-replacements\' + $transactionId + '\displaced')
+                }
+                CheckPath $targetDisplacedDir
+                $displaced = Join-Path $targetDisplacedDir ('{0:D2}.bin' -f $records.Count)
+                $movePairs[$path] = $displaced
+                $movePairs[$displaced] = $path
+            }
+        }
+        $records += [ordered]@{path=$path;source=$target.name;existed=$existed;old_sha256=$oldHash;new_sha256=$packageFiles[(Join-Path $PackageDir $target.name)].sha256;backup=$backup;displaced=$displaced}
+    }
+    $manifest = [ordered]@{
+        schema=1;transaction_id=$transactionId;created_at=(Get-Date -Format 'o');state='installing'
+        install_dir=$InstallDir;bin_dir=$BinDir;package_dir=$PackageDir;payload_sha256=$payloadHash;loader_version=$versions[0]
+        integrity='Unsigned package; SHA256 verifies consistency, not publisher identity.';files=$records
+        allow_in_use_rename=[bool]$AllowInUseRename
+    }
+    [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8), $utf8)
+    $manifestWritten = $true
+} catch {
+    if (-not $manifestWritten) {
+        if (Test-Path -LiteralPath $transactionRoot) { Remove-Item -LiteralPath $transactionRoot -Recurse -Force -ErrorAction SilentlyContinue }
+        if (-not $existedReplacements -and (Test-Path -LiteralPath $replacementsRoot) -and @((Get-ChildItem -LiteralPath $replacementsRoot -Force)).Count -eq 0) {
+            Remove-Item -LiteralPath $replacementsRoot -Force -ErrorAction SilentlyContinue
+        }
+        if (-not $existedInstallDir -and (Test-Path -LiteralPath $InstallDir) -and @((Get-ChildItem -LiteralPath $InstallDir -Force)).Count -eq 0) {
+            Remove-Item -LiteralPath $InstallDir -Force -ErrorAction SilentlyContinue
         }
     }
-    $records += [ordered]@{path=$path;source=$target.name;existed=$existed;old_sha256=$oldHash;new_sha256=$packageFiles[(Join-Path $PackageDir $target.name)].sha256;backup=$backup;displaced=$displaced}
+    throw
 }
-$manifest = [ordered]@{
-    schema=1;transaction_id=$transactionId;created_at=(Get-Date -Format 'o');state='installing'
-    install_dir=$InstallDir;bin_dir=$BinDir;package_dir=$PackageDir;payload_sha256=$payloadHash;loader_version=$versions[0]
-    integrity='Unsigned package; SHA256 verifies consistency, not publisher identity.';files=$records
-    allow_in_use_rename=[bool]$AllowInUseRename
-}
-[IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8), $utf8)
 $attempted = @()
 try {
     foreach ($record in $records) {
@@ -217,7 +258,11 @@ try {
         $parent = Split-Path -Parent $record.path
         if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent | Out-Null }
         $attempted += $record
-        if ($record.displaced) { MoveVerified $record.path $record.displaced $record.old_sha256 }
+        if ($record.displaced) {
+            $displacedParent = Split-Path -Parent $record.displaced
+            if (-not (Test-Path -LiteralPath $displacedParent)) { New-Item -ItemType Directory -Path $displacedParent -Force | Out-Null }
+            MoveVerified $record.path $record.displaced $record.old_sha256
+        }
         Copy-Item -LiteralPath (Join-Path $stageDir $record.source) -Destination $record.path -Force
         if ((Hash $record.path) -ne $record.new_sha256) { throw "Installed checksum mismatch: $($record.path)" }
     }
@@ -236,6 +281,13 @@ try {
                     if (Test-Path -LiteralPath $record.path) { Remove-Item -LiteralPath $record.path -Force }
                     MoveVerified $record.displaced $record.path $record.old_sha256
                 } elseif (-not (Test-Path -LiteralPath $record.path -PathType Leaf) -or (Hash $record.path) -ne $record.old_sha256) { throw "Original image missing: $($record.path); displaced=$($record.displaced)" }
+                $cursor = Split-Path -Parent $record.displaced
+                while ($cursor -and (Split-Path -Leaf $cursor) -in @('displaced', $transactionId, '.local-replacements')) {
+                    if ((Test-Path -LiteralPath $cursor) -and @((Get-ChildItem -LiteralPath $cursor -Force)).Count -eq 0) {
+                        Remove-Item -LiteralPath $cursor -Force -ErrorAction SilentlyContinue
+                        $cursor = Split-Path -Parent $cursor
+                    } else { break }
+                }
             }
             elseif ($record.existed) { Copy-Item -LiteralPath $record.backup -Destination $record.path -Force }
             elseif (Test-Path -LiteralPath $record.path) { Remove-Item -LiteralPath $record.path -Force }

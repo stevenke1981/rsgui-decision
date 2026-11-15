@@ -2,9 +2,13 @@
 [CmdletBinding()]
 param([string]$InstallDir = $PSScriptRoot)
 $ErrorActionPreference = 'Stop'
-$InstallDir = [IO.Path]::GetFullPath($InstallDir)
+function FullPath([string]$Path) {
+    if ([IO.Path]::IsPathRooted($Path)) { [IO.Path]::GetFullPath($Path) }
+    else { [IO.Path]::GetFullPath((Join-Path (Get-Location -PSProvider FileSystem).ProviderPath $Path)) }
+}
+$InstallDir = FullPath $InstallDir
 $manifestPath = Join-Path $InstallDir '.install\manifest.json'
-$manifest = Get-Content -LiteralPath $manifestPath -Raw | ConvertFrom-Json
+$manifest = Get-Content -LiteralPath $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
 if ($manifest.version -ne 1 -or [IO.Path]::GetFullPath($manifest.install_dir) -ne $InstallDir) { throw 'Manifest does not match this installation.' }
 $pending = New-Object System.Collections.ArrayList
 $directories = New-Object System.Collections.ArrayList

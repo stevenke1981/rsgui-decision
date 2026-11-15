@@ -18,7 +18,10 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2
 $utf8 = New-Object System.Text.UTF8Encoding($false)
 $package = $PSScriptRoot
-function Full([string]$Path) { [IO.Path]::GetFullPath($Path) }
+function Full([string]$Path) {
+    if ([IO.Path]::IsPathRooted($Path)) { [IO.Path]::GetFullPath($Path) }
+    else { [IO.Path]::GetFullPath((Join-Path (Get-Location -PSProvider FileSystem).ProviderPath $Path)) }
+}
 function WriteUtf8([string]$Path, [string]$Text) { [IO.File]::WriteAllText($Path, $Text, $utf8) }
 function Hash([string]$Path) { (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash }
 function Hosts([string[]]$Items) {
@@ -60,7 +63,7 @@ $manifestPath = Join-Path $InstallDir '.install\manifest.json'
 if (Test-Path -LiteralPath $manifestPath) { throw 'An AutoGui installation exists. Run its uninstall.ps1 first; modified files are preserved.' }
 if ((Test-Path -LiteralPath $InstallDir) -and @(Get-ChildItem -LiteralPath $InstallDir -Recurse -File -Force).Count) { throw "Install directory must contain no existing files: $InstallDir" }
 
-$payload = Get-Content -LiteralPath (Join-Path $package 'payload.json') -Raw | ConvertFrom-Json
+$payload = Get-Content -LiteralPath (Join-Path $package 'payload.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 $copies = New-Object System.Collections.ArrayList
 foreach ($item in $payload.files) {
     $source = Full (Join-Path $package $item.path)

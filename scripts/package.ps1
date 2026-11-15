@@ -3,9 +3,17 @@
 param([string]$OutputDir, [switch]$SkipBuild)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
+function FullPath([string]$Path) {
+    $base = (Get-Location -PSProvider FileSystem).ProviderPath
+    $full = if ([IO.Path]::IsPathRooted($Path)) { [IO.Path]::GetFullPath($Path) } else { [IO.Path]::GetFullPath((Join-Path $base $Path)) }
+    if ($full.Length -gt [IO.Path]::GetPathRoot($full).Length) { $full = $full.TrimEnd('\') }
+    $full
+}
 if (-not $OutputDir) { $OutputDir = Join-Path $repo ('dist\rsgui-decision-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
-$OutputDir = [IO.Path]::GetFullPath($OutputDir)
+$OutputDir = FullPath $OutputDir
+if ($OutputDir.Length -le [IO.Path]::GetPathRoot($OutputDir).Length) { throw "Refusing to package directly into drive root: $OutputDir" }
 if (Test-Path -LiteralPath $OutputDir) { throw "Output already exists: $OutputDir" }
+if (Test-Path -LiteralPath "$OutputDir.zip") { throw "Output archive already exists: $OutputDir.zip" }
 if (-not $SkipBuild) {
     Push-Location $repo
     try { & cargo build --release --workspace --all-features --locked; if ($LASTEXITCODE -ne 0) { throw 'Build failed' } }
