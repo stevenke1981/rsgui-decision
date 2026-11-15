@@ -17,7 +17,9 @@ function StartMcp([string]$Path) {
     $start.StandardErrorEncoding=[Text.Encoding]::UTF8
     $process=New-Object Diagnostics.Process
     $process.StartInfo=$start
-    [void]$process.Start()
+    $inputEncoding=[Console]::InputEncoding
+    try { [Console]::InputEncoding=New-Object Text.UTF8Encoding($false); [void]$process.Start() }
+    finally { [Console]::InputEncoding=$inputEncoding }
     $stderr=$process.StandardError.ReadToEndAsync()
     @{Process=$process;ErrorTask=$stderr;Next=0}
 }

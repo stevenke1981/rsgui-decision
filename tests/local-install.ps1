@@ -39,7 +39,10 @@ function StartOwnMcp([string]$Path) {
     $start.FileName=$Path; $start.Arguments='mcp'; $start.UseShellExecute=$false; $start.CreateNoWindow=$true
     $start.RedirectStandardInput=$true; $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
     $start.StandardOutputEncoding=[Text.Encoding]::UTF8; $start.StandardErrorEncoding=[Text.Encoding]::UTF8
-    $process=New-Object Diagnostics.Process; $process.StartInfo=$start; [void]$process.Start()
+    $process=New-Object Diagnostics.Process; $process.StartInfo=$start
+    $inputEncoding=[Console]::InputEncoding
+    try { [Console]::InputEncoding=New-Object Text.UTF8Encoding($false); [void]$process.Start() }
+    finally { [Console]::InputEncoding=$inputEncoding }
     @{Process=$process;Stderr=$process.StandardError.ReadToEndAsync();Id=0}
 }
 function Request($Client,[string]$Method,$Params) {
@@ -89,7 +92,10 @@ $absentBefore = Join-Path $bin 'autogui_runtime.dll'
 $markerHash = Hash $marker
 $outsideHash = Hash $outside
 $unrelatedHash = Hash $unrelated
+$originalInputEncoding = [Console]::InputEncoding
 try {
+    # Match Windows PowerShell 5.1 hosted runners, even on a Big5 developer host.
+    [Console]::InputEncoding = New-Object Text.UTF8Encoding($true)
     $manifest1 = & $installer -PackageDir $PackageDir -InstallDir $install -BinDir $bin
     Assert (Test-Path -LiteralPath $manifest1 -PathType Leaf) 'First installation did not return a manifest'
     $data1 = [IO.File]::ReadAllText($manifest1,[Text.Encoding]::UTF8) | ConvertFrom-Json
@@ -227,4 +233,4 @@ try {
         Write-Host "PASS in-use rename: old version=$oldVersion tools=$oldToolCount stayed alive; new version=$newVersion tools=19; failed-write rollback and restore after new EOF verified."
     } finally { StopOwnMcp $newClient; StopOwnMcp $oldClient }
     Write-Host 'PASS local replacement: staged version/MCP, hashes, unique reinstall backups, original metadata, tamper refusal, verified restore/failed-write rollback, absent-file removal, lock/package rejection.'
-} finally { Write-Host "Local installer test evidence: $fixture" }
+} finally { [Console]::InputEncoding = $originalInputEncoding; Write-Host "Local installer test evidence: $fixture" }

@@ -56,7 +56,13 @@ function StartProbe([string]$Path, [string]$Arguments) {
     $start.StandardErrorEncoding = [Text.Encoding]::UTF8
     $process = New-Object Diagnostics.Process
     $process.StartInfo = $start
-    [void]$process.Start()
+    # .NET Framework creates stdin's AutoFlush writer during Start(), inheriting
+    # Console.InputEncoding. A UTF-8 BOM would corrupt the first JSONL request.
+    $inputEncoding = [Console]::InputEncoding
+    try {
+        [Console]::InputEncoding = New-Object Text.UTF8Encoding($false)
+        [void]$process.Start()
+    } finally { [Console]::InputEncoding = $inputEncoding }
     @{ Process=$process; ErrorTask=$process.StandardError.ReadToEndAsync() }
 }
 function VerifyLoader([string]$Path, [switch]$Mcp) {
