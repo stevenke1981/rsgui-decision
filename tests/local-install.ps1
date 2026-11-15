@@ -96,6 +96,24 @@ try {
     Assert (-not (Test-Path -LiteralPath $absentBefore)) 'Restore retained a file absent before install'
     Assert ((Hash $marker) -eq $markerHash -and (Hash $outside) -eq $outsideHash -and (Hash $unrelated) -eq $unrelatedHash) 'Restore changed unrelated files'
 
+    # Inject a destination write failure after the program pair was replaced.
+    # The actual package probes/copies run; only this one final write is denied.
+    & {
+        function Copy-Item {
+            [CmdletBinding()]
+            param([string]$LiteralPath,[string]$Destination,[switch]$Force)
+            if ($Destination -eq $absentBefore) { throw 'Injected destination write failure' }
+            Microsoft.PowerShell.Management\Copy-Item @PSBoundParameters
+        }
+        MustFail { & $installer -PackageDir $PackageDir -InstallDir $install -BinDir $bin } 'Injected destination write failure'
+    }
+    foreach ($path in $originals.Keys) { Assert ((Hash $path) -eq $originals[$path]) "Failed install did not roll back: $path" }
+    Assert (-not (Test-Path -LiteralPath $absentBefore)) 'Failed install retained a newly created target'
+    $transactions = @(Get-ChildItem -LiteralPath (Join-Path $install '.local-replacements') -Directory | ForEach-Object {
+        [IO.File]::ReadAllText((Join-Path $_.FullName 'manifest.json'),[Text.Encoding]::UTF8) | ConvertFrom-Json
+    })
+    Assert (@($transactions | Where-Object {$_.state -eq 'rolled_back'}).Count -eq 1) 'Failed install did not record verified rollback'
+
     $lockedInstall = Join-Path $fixture 'locked install'
     New-Item -ItemType Directory -Path $lockedInstall | Out-Null
     $lockedPath = Join-Path $lockedInstall 'autogui-control.exe'
@@ -116,5 +134,5 @@ try {
     FixturePackage $incomplete -MissingRuntime
     MustFail { & $installer -PackageDir $incomplete -InstallDir $rejectedInstall -BinDir (Join-Path $fixture 'rejected bin') } 'Missing mandatory package file'
     Assert (-not (Test-Path -LiteralPath $rejectedInstall)) 'Incomplete package created target directories'
-    Write-Host 'PASS local replacement: staged version/MCP, hashes, unique reinstall backups, original metadata, tamper refusal, verified restore, absent-file removal, lock/package rejection.'
+    Write-Host 'PASS local replacement: staged version/MCP, hashes, unique reinstall backups, original metadata, tamper refusal, verified restore/failed-write rollback, absent-file removal, lock/package rejection.'
 } finally { Write-Host "Local installer test evidence: $fixture" }
