@@ -3,7 +3,7 @@
 param([string]$OutputDir, [switch]$SkipBuild)
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-if (-not $OutputDir) { $OutputDir = Join-Path $repo ('dist\autogui-agent-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
+if (-not $OutputDir) { $OutputDir = Join-Path $repo ('dist\rsgui-decision-' + (Get-Date -Format 'yyyyMMdd-HHmmss')) }
 $OutputDir = [IO.Path]::GetFullPath($OutputDir)
 if (Test-Path -LiteralPath $OutputDir) { throw "Output already exists: $OutputDir" }
 if (-not $SkipBuild) {
@@ -12,7 +12,7 @@ if (-not $SkipBuild) {
     finally { Pop-Location }
 }
 New-Item -ItemType Directory -Path $OutputDir | Out-Null
-foreach ($name in @('autogui-control.exe','autogui_runtime.dll')) {
+foreach ($name in @('autogui-control.exe','rsgui-decision.exe','autogui_runtime.dll')) {
     Copy-Item -LiteralPath (Join-Path $repo "target\release\$name") -Destination $OutputDir
 }
 foreach ($name in @('install.ps1','uninstall.ps1','install.cmd','ConfigEditor.cs')) {
@@ -20,13 +20,20 @@ foreach ($name in @('install.ps1','uninstall.ps1','install.cmd','ConfigEditor.cs
 }
 Copy-Item -LiteralPath (Join-Path $repo 'skills') -Destination $OutputDir -Recurse
 New-Item -ItemType Directory -Path (Join-Path $OutputDir 'docs') | Out-Null
-foreach ($name in @('agent-installation.md','validation-agent.md','recognition-app-control.md','screensaver.md','virtual-display.md','validation-virtual-display.md','headless.md')) {
+foreach ($name in @('agent-installation.md','decision-integration.md','validation-agent.md','recognition-app-control.md','screensaver.md','virtual-display.md','validation-virtual-display.md','headless.md')) {
     Copy-Item -LiteralPath (Join-Path $repo "docs\$name") -Destination (Join-Path $OutputDir 'docs')
 }
 New-Item -ItemType Directory -Path (Join-Path $OutputDir 'scripts') | Out-Null
 foreach ($name in @('virtual-display.ps1','rdp-to-console.ps1')) {
     Copy-Item -LiteralPath (Join-Path $repo "scripts\$name") -Destination (Join-Path $OutputDir 'scripts')
 }
+foreach ($name in @('install-local.ps1','restore-local.ps1')) {
+    Copy-Item -LiteralPath (Join-Path $repo "scripts\$name") -Destination $OutputDir
+}
+foreach ($name in @('LICENSE','THIRD_PARTY_NOTICES.md')) {
+    Copy-Item -LiteralPath (Join-Path $repo $name) -Destination $OutputDir
+}
+Copy-Item -LiteralPath (Join-Path $repo 'examples\support\decision_tools.json') -Destination (Join-Path $OutputDir 'docs\decision-tools.json')
 Copy-Item -LiteralPath (Join-Path $repo 'examples\support\mcp_tools.json') -Destination (Join-Path $OutputDir 'docs\mcp-tools.json')
 Copy-Item -LiteralPath (Join-Path $repo 'README.md') -Destination $OutputDir
 $files = @(Get-ChildItem -LiteralPath $OutputDir -Recurse -File | ForEach-Object {

@@ -15,7 +15,8 @@ use thiserror::Error;
 const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/decisions";
 const MODEL: &str = "gemini-decision-1";
 const CATCHALLS: [&str; 4] = ["observe", "wait", "stop", "done"];
-const MAX_IMAGE_BASE64: usize = 12 * 1024 * 1024;
+// Matches the desktop executor's 12 MiB PNG ceiling after base64 expansion.
+const MAX_IMAGE_BASE64: usize = 16 * 1024 * 1024;
 const MAX_RESPONSE: u64 = 1024 * 1024;
 const SEMANTIC_THRESHOLD: f64 = 0.85;
 /// Published input-only price for `gemini-decision-1`.

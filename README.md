@@ -1,4 +1,29 @@
-# rsautogui
+# rsgui-decision
+
+Rust 桌面操作與 Gemini Decision 1 的整合專案。沿用 rsautogui 的原生執行核心，
+將 GUI 所需決策契約重寫為 Rust，提供一個常駐 MCP 程序：
+**觀察 → 固定候選決策 → 一次操作 → 本機適應等待 → 新截圖**。
+
+`decision_step` 把一次操作、等待與新畫面合成一次宿主呼叫；原有 14 個
+rsautogui 工具與 `autogui-control` CLI 保留。新工具不接受模型生成的命令或座標，
+只執行呼叫者已提供並由伺服器保存的候選。執行前核對視窗、完整畫面與單次憑證。
+
+```powershell
+cargo build --release --workspace --all-features --locked
+.\target\release\rsgui-decision.exe --version
+.\target\release\rsgui-decision.exe mcp
+```
+
+EXE 與 `autogui_runtime.dll` 必須放在同目錄。預設 `RSGUI_DECISION_MODE=local`，
+不發送網路請求。單一候選代表呼叫者已選定的動作；多候選時 local 回傳 observe，
+不猜測畫面。明確設定 `auto` 或 `gemini` 及 `GEMINI_API_KEY` 才啟用 Google API；
+此時會傳送所選視窗影像。原六種 coding-agent 決策域並未全部移植。
+
+使用方式、成本／影像說明、驗收與升級還原見
+[整合指南](docs/decision-integration.md)；來源、版本與授權見
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。
+
+## 原生 rsautogui 相容功能
 
 Rust-powered Windows desktop automation for AI agents: image recognition, Win32 app control, an MCP server, and reusable Skills.
 

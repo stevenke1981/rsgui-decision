@@ -14,6 +14,7 @@ impl Client {
     pub fn start(path: &str) -> Self {
         let mut child = Command::new(path)
             .arg("mcp")
+            .env("RSGUI_DECISION_MODE", "local")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -46,7 +47,7 @@ impl Client {
                 .as_array()
                 .unwrap()
                 .len(),
-            14
+            19
         );
         client
     }
@@ -70,13 +71,16 @@ impl Client {
         self.request("tools/call", json!({"name":name,"arguments":args}))
     }
     pub fn cancelled_tool(&mut self, name: &str, args: Value) -> Value {
+        self.cancelled_tool_after(name, args, Duration::from_millis(100))
+    }
+    pub fn cancelled_tool_after(&mut self, name: &str, args: Value, delay: Duration) -> Value {
         // Late/unknown cancellations must not fill a permanent cancellation set.
         for id in 10_000..10_100 {
             self.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":id}}));
         }
         self.next += 1;
         self.send(json!({"jsonrpc":"2.0","id":self.next,"method":"tools/call","params":{"name":name,"arguments":args}}));
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(delay);
         self.send(json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":self.next}}));
         let value = self
             .output

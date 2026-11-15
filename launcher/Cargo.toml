@@ -8,6 +8,10 @@ license = "MIT"
 name = "autogui-control"
 path = "src/main.rs"
 
+[[bin]]
+name = "rsgui-decision"
+path = "src/rsgui.rs"
+
 [dependencies]
 serde_json = "1"
 
