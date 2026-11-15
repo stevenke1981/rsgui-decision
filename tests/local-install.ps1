@@ -71,7 +71,8 @@ function StopOwnMcp($Client) {
     Assert ($Client.Process.ExitCode -eq 0) "Own MCP child failed: $($Client.Stderr.Result)"
 }
 
-$fixture = Join-Path $env:TEMP ('rsgui-local-install-' + [guid]::NewGuid().ToString('N'))
+# Match the installer's canonical paths, including RUNNER~1 short TEMP aliases.
+$fixture = [IO.Path]::GetFullPath((Join-Path $env:TEMP ('rsgui-local-install-' + [guid]::NewGuid().ToString('N'))))
 # Spaces, Chinese text and a nested path exercise paths without shell interpolation.
 $install = Join-Path $fixture 'AutoGui 舊安裝\with spaces\program'
 $bin = Join-Path $fixture 'profile 中文\local bin'
