@@ -416,7 +416,9 @@ impl Session {
                     gui.move_to_xy(point.x, point.y)?;
                 }
                 proof.verify(gui, &window, display.as_ref(), point, check)?;
-                if gui.position()? != point {
+                let actual = gui.position()?;
+                if actual != point {
+                    eprintln!("autogui pointer readback: expected={point:?}, actual={actual:?}");
                     return Err(Error::InvalidArgument(
                         "cursor moved before input; capture again",
                     ));

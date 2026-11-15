@@ -1,5 +1,8 @@
 # rsgui-decision
 
+目前狀態：Rust 整合、離線測試與 Windows CI 已通過；實機點擊仍有游標位置偏差待定位，
+尚未完成整段桌面輸入與流暢度驗收。詳見[驗證狀態](docs/team/verification.md)。
+
 Rust 桌面操作與 Gemini Decision 1 的整合專案。沿用 rsautogui 的原生執行核心，
 將 GUI 所需決策契約重寫為 Rust，提供一個常駐 MCP 程序：
 **觀察 → 固定候選決策 → 一次操作 → 本機適應等待 → 新截圖**。

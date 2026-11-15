@@ -33,7 +33,33 @@ fn integrated_decision_native_fixture() {
     let title = format!("rsgui decision fixture {}", std::process::id());
     let fixture = Fixture::open(&title, pointer);
     let window = gui.get_windows_with_title(&title).unwrap().remove(0);
-    if let Err(error) = window.activate() {
+    if std::env::var("RSGUI_LIVE_MANUAL_START").ok().as_deref() == Some("1") {
+        unsafe {
+            SetWindowTextW(fixture.handles.button as HWND, wide("開始測試").as_ptr());
+            UpdateWindow(fixture.handles.button as HWND);
+        }
+        eprintln!(
+            "WAIT_FOR_OPERATOR_START {title}: click 開始測試; the fixture remains open for ten minutes"
+        );
+        let waiting = Instant::now();
+        while fixture.clicks.load(Ordering::SeqCst) == 0 || !window.is_active().unwrap() {
+            assert!(
+                waiting.elapsed() < Duration::from_secs(600),
+                "operator start not received: clicks={}, active={}",
+                fixture.clicks.load(Ordering::SeqCst),
+                window.is_active().unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        fixture.clicks.store(0, Ordering::SeqCst);
+        unsafe {
+            SetWindowTextW(
+                fixture.handles.button as HWND,
+                wide("辨識測試按鈕 7X").as_ptr(),
+            );
+            UpdateWindow(fixture.handles.button as HWND);
+        }
+    } else if let Err(error) = window.activate() {
         eprintln!(
             "WAIT_FOR_FIXTURE_FOCUS {title}: {error}; foreground only this test-owned window through the supported desktop surface"
         );
@@ -46,7 +72,68 @@ fn integrated_decision_native_fixture() {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+    // Initial activation/hover animation must settle before a pixel-bound proof.
+    let waiting = Instant::now();
+    let mut stable_since = Instant::now();
+    let mut previous = gui.screenshot_region(window.box_rect().unwrap()).unwrap();
+    loop {
+        std::thread::sleep(Duration::from_millis(50));
+        let current = gui.screenshot_region(window.box_rect().unwrap()).unwrap();
+        if current != previous {
+            stable_since = Instant::now();
+        }
+        if stable_since.elapsed() >= Duration::from_millis(250) {
+            break;
+        }
+        assert!(
+            waiting.elapsed() < Duration::from_secs(5),
+            "fixture startup pixels did not settle"
+        );
+        previous = current;
+    }
     let button = autogui::center(native_rect(fixture.handles.button));
+    let primary = autogui::Display::all()
+        .unwrap()
+        .into_iter()
+        .find(autogui::Display::is_primary)
+        .unwrap();
+    let mut primary_moves_match = true;
+    let configured_pause = gui.settings().pause;
+    gui.settings_mut().pause = Duration::ZERO;
+    for offset in [-6, 0, 6] {
+        assert!(
+            window.is_active().unwrap(),
+            "owned fixture lost focus before pointer diagnostics"
+        );
+        let expected = Point::new(button.x + offset, button.y + offset);
+        gui.move_to_xy(expected.x, expected.y).unwrap();
+        let injected = Instant::now();
+        let mut default_actual = gui.position().unwrap();
+        for sample_ms in [0, 2, 10, 25, 100] {
+            std::thread::sleep(Duration::from_millis(sample_ms).saturating_sub(injected.elapsed()));
+            default_actual = gui.position().unwrap();
+            let mut physical = windows_sys::Win32::Foundation::POINT::default();
+            let physical_ok = unsafe { GetPhysicalCursorPos(&mut physical) };
+            eprintln!(
+                "POINTER_SAMPLE expected={expected:?} requested_ms={sample_ms} elapsed_ms={} actual={default_actual:?} physical_ok={physical_ok} physical=({}, {})",
+                injected.elapsed().as_millis(),
+                physical.x,
+                physical.y
+            );
+        }
+        gui.move_to_display(&primary, expected).unwrap();
+        let explicit_actual = gui.position().unwrap();
+        eprintln!(
+            "POINTER_DIAGNOSTIC expected={expected:?} default={default_actual:?} explicit_display={explicit_actual:?}"
+        );
+        primary_moves_match &= default_actual == expected;
+        assert_eq!(explicit_actual, expected, "explicit physical display move");
+    }
+    assert!(
+        primary_moves_match,
+        "cursor was not at the requested point after 100 ms; no click sent"
+    );
+    gui.settings_mut().pause = configured_pause;
     gui.move_to_xy(button.x, button.y).unwrap();
     let mut client = mcp_client::Client::start(&executable);
     let list = client.tool("windows_list", json!({"title":title}));

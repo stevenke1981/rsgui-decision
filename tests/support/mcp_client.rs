@@ -89,6 +89,7 @@ impl Client {
         assert_eq!(value["id"], self.next);
         value["result"].clone()
     }
+    #[track_caller]
     pub fn tool(&mut self, name: &str, args: Value) -> Value {
         let value = self.raw_tool(name, args);
         assert_eq!(value["isError"], false, "tool {name}: {value}");
