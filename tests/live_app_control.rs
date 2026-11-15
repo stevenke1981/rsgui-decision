@@ -89,6 +89,9 @@ unsafe extern "system" fn procedure(
             }
             return 0;
         }
+        WM_APP => {
+            return unsafe { HideCaret(GetDlgItem(hwnd, 101)) } as LRESULT;
+        }
         WM_DESTROY => {
             unsafe {
                 PostQuitMessage(0);

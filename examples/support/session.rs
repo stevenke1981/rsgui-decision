@@ -14,6 +14,7 @@ pub(crate) struct DisplayFact {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(any(all(windows, feature = "os"), test)), allow(dead_code))]
 pub(crate) enum Probe {
     /// Real pixels were read; `uniform` means every pixel had the same value.
     Captured {
@@ -156,6 +157,7 @@ pub(crate) fn ready(findings: &[Finding]) -> bool {
     !findings.iter().any(|f| f.level == Level::Blocker)
 }
 
+#[cfg(any(all(windows, feature = "os"), test))]
 fn uniform(pixels: &[u8]) -> bool {
     pixels.as_chunks::<3>().0.iter().all(|p| p == &pixels[..3])
 }

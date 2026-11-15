@@ -4,7 +4,7 @@ use autogui::{Error, Result};
 #[cfg(windows)]
 #[path = "screensaver_windows.rs"]
 mod platform;
-#[cfg(windows)]
+#[cfg(all(windows, feature = "os"))]
 pub(super) use platform::input_desktop;
 
 #[derive(Debug, PartialEq, Eq)]

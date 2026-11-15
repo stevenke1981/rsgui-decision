@@ -307,9 +307,7 @@ mod platform {
         Ok(String::from_utf16_lossy(&buffer[..read.max(0) as usize]))
     }
 
-    pub fn rect(window: &Window) -> Result<Rect> {
-        let _dpi = DpiGuard::enter()?;
-        let hwnd = ensure_window(window)?;
+    fn rect_hwnd(hwnd: HWND, window: &Window) -> Result<Rect> {
         let mut rect = RECT::default();
         if unsafe { GetWindowRect(hwnd, &mut rect) } == 0 {
             return Err(api_error(window, "GetWindowRect"));
@@ -320,6 +318,15 @@ mod platform {
             rect.right.saturating_sub(rect.left),
             rect.bottom.saturating_sub(rect.top),
         ))
+    }
+
+    fn rect_in_dpi(window: &Window) -> Result<Rect> {
+        rect_hwnd(ensure_window(window)?, window)
+    }
+
+    pub fn rect(window: &Window) -> Result<Rect> {
+        let _dpi = DpiGuard::enter()?;
+        rect_in_dpi(window)
     }
 
     pub fn is_minimized(window: &Window) -> Result<bool> {
@@ -337,9 +344,10 @@ mod platform {
         operation: &str,
         mut done: impl FnMut(HWND) -> Result<bool>,
     ) -> Result<()> {
+        let _dpi = DpiGuard::enter()?;
         let start = Instant::now();
         loop {
-            check_failsafe(&window.settings)?;
+            check_failsafe_in_dpi(&window.settings)?;
             if done(ensure_window(window)?)? {
                 return Ok(());
             }
@@ -437,7 +445,7 @@ mod platform {
     pub fn move_to(window: &Window, left: i32, top: i32) -> Result<()> {
         let _dpi = DpiGuard::enter()?;
         ensure_restored(window)?;
-        let current = rect(window)?;
+        let current = rect_in_dpi(window)?;
         if unsafe {
             SetWindowPos(
                 ensure_window(window)?,
@@ -452,8 +460,8 @@ mod platform {
         {
             return Err(api_error(window, "SetWindowPos(move)"));
         }
-        wait_state(window, "move", |_| {
-            let current = rect(window)?;
+        wait_state(window, "move", |hwnd| {
+            let current = rect_hwnd(hwnd, window)?;
             Ok(current.left == left && current.top == top)
         })
     }
@@ -465,7 +473,7 @@ mod platform {
         }
         let _dpi = DpiGuard::enter()?;
         ensure_restored(window)?;
-        let current = rect(window)?;
+        let current = rect_in_dpi(window)?;
         if unsafe {
             SetWindowPos(
                 ensure_window(window)?,
@@ -483,11 +491,21 @@ mod platform {
         wait_state(
             window,
             "resize (application size constraints may apply)",
-            |_| {
-                let current = rect(window)?;
+            |hwnd| {
+                let current = rect_hwnd(hwnd, window)?;
                 Ok(current.width == width && current.height == height)
             },
         )
+    }
+
+    fn check_failsafe_in_dpi(settings: &WindowSettings) -> Result<()> {
+        if settings.failsafe {
+            let point = crate::dpi::cursor_position_in_dpi()?;
+            if settings.failsafe_points.contains(&point) {
+                return Err(Error::FailSafe(point));
+            }
+        }
+        Ok(())
     }
 
     pub fn check_failsafe(settings: &WindowSettings) -> Result<()> {
@@ -505,7 +523,9 @@ mod platform {
             return 1;
         }
         match from_hwnd(hwnd) {
-            Ok(window) if rect(&window).is_ok_and(|rect| rect.width > 0 && rect.height > 0) => {
+            Ok(window)
+                if rect_in_dpi(&window).is_ok_and(|rect| rect.width > 0 && rect.height > 0) =>
+            {
                 // The caller owns this vector for the synchronous EnumWindows call.
                 unsafe { &mut *(lparam as *mut Vec<Window>) }.push(window);
             }

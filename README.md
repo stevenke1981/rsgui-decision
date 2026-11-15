@@ -7,9 +7,8 @@ Rust 桌面操作與 Gemini Decision 1 的整合專案。沿用 rsautogui 的原
 將 GUI 所需決策契約重寫為 Rust，提供一個常駐 MCP 程序：
 **觀察 → 固定候選決策 → 一次操作 → 本機適應等待 → 新截圖**。
 
-`decision_step` 把一次操作、等待與新畫面合成一次宿主呼叫；原有 14 個
-rsautogui 工具與 `autogui-control` CLI 保留。新工具不接受模型生成的命令或座標，
-只執行呼叫者已提供並由伺服器保存的候選。執行前核對視窗、完整畫面與單次憑證。
+`decision_step` 把一次操作、等待與新畫面合成一次宿主呼叫；MCP 總計提供 19 個工具：保留原有 14 個 rsautogui 工具，加上 5 個決策工具（`decision_observe`、`decision_evaluate`、`decision_act`、`decision_step`、`decision_status`），並保留 `autogui-control` CLI。新工具不接受模型生成的命令或座標，
+只執行呼叫者已提供並由伺服器保存的候選。執行前核對視窗、完整畫面與單次憑證。工具 schema 見 `examples/support/mcp_tools.json` 與 `examples/support/decision_tools.json`（發行包內為 `docs/mcp-tools.json` 與 `docs/decision-tools.json`）。
 
 ```powershell
 cargo build --release --workspace --all-features --locked
@@ -41,15 +40,15 @@ The `autogui` library is independently implemented in Rust and modeled on PyAuto
 發行包解壓縮後執行 `install.cmd`，可分別選擇安裝 **Skill** 與 **MCP** 給 Codex、Claude、OpenCode、AGY，也能只安裝程式或自訂 Skill 目錄。安裝器備份既有設定；解除安裝保護後續修改。不要將 EXE 與 DLL 分開移動。
 
 ```powershell
-git clone https://github.com/urtiger101-tw/rsautogui.git
-cd rsautogui
+git clone https://github.com/stevenke1981/rsgui-decision.git
+cd rsgui-decision
 cargo build --release --workspace --all-features --locked
 .\target\release\autogui-control.exe --help
-.\target\release\autogui-control.exe mcp
+.\target\release\rsgui-decision.exe mcp
 .\scripts\package.ps1 -SkipBuild
 ```
 
-MCP 提供 14 個工具，涵蓋無人值守就緒檢查、顯示器／視窗列舉、指定顯示器截圖、移動 App、Win32 控制、找圖、點擊、捲動、文字、快捷鍵與螢幕保護程式。`capture` 回傳一次性 `capture_id`，可直接使用截圖內座標呼叫 `click_at`／`scroll`，省去外部裁圖。Agent 適用操作 Skill 隨包提供；詳見 [安裝、DLL 與 MCP 指南](docs/agent-installation.md)。
+MCP 提供 19 個工具，涵蓋無人值守就緒檢查、顯示器／視窗列舉、指定顯示器截圖、移動 App、Win32 控制、找圖、點擊、捲動、文字、快捷鍵、螢幕保護程式，以及 5 個 bounded decision 工具（`decision_observe`、`decision_evaluate`、`decision_act`、`decision_step`、`decision_status`）。`capture`（喚起前景）與 `decision_observe`（不搶焦點之被動擷取）回傳一次性 `capture_id`，可直接使用截圖內座標呼叫 `click_at`／`scroll` 或固定候選決策工具，省去外部裁圖。Agent 適用操作 Skill 隨包提供；詳見 [安裝、DLL 與 MCP 指南](docs/agent-installation.md) 與 [整合指南](docs/decision-integration.md)。
 
 ## 虛擬顯示器
 
@@ -77,7 +76,7 @@ MCP 對應唯讀工具 `session_status`。各情境與限制見 [無螢幕／無
 
 ```toml
 [dependencies]
-autogui = { path = "../rsautogui", features = ["opencv"] }
+autogui = { path = "../rsgui-decision", features = ["opencv"] }
 ```
 
 The default `os` feature uses Enigo for real input and XCap for screen capture. For deterministic, headless code, construct `AutoGui::with_fake(FakeBackend::new(width, height))`. Building with `default-features = false` also selects the fake backend.
@@ -201,7 +200,7 @@ Reproduce with `cargo run --release --features opencv --example recognition_benc
 - Image misses return `Error::ImageNotFound`; use `try_locate_on_screen` for an optional result. `set_raise_image_not_found(false)` makes locate-all calls return an empty vector on misses.
 - `Screenshot` replaces Pillow images. Common raster formats are loaded and saved through the Rust `image` crate.
 - Message boxes are out of scope. Window control is available only on Windows.
-- Multi-monitor virtual-desktop coordinates and OCR are out of scope.
+- OCR is out of scope (explicit multi-monitor virtual-desktop coordinates are supported via display-targeted Windows APIs and tools).
 
 ## License
 

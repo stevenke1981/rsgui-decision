@@ -34,7 +34,7 @@ Codex 的 MCP 安裝需要本機 Codex CLI；其餘宿主只寫設定檔。JSONC
 
 ## DLL 載入
 
-`autogui-control.exe` 是小型啟動程式與 MCP 協定端點。`--help`、MCP `initialize`、`ping`、`tools/list` 不載入 `autogui_runtime.dll`。第一次 `tools/call` 才載入 DLL；CLI 的實際控制命令也會載入。DLL 在該程序存續期間共用，結束連線時釋放暫停租約，模組本身保持映射至程序結束，以保護 Rust TLS/背景清理。
+`autogui-control.exe` 與 `rsgui-decision.exe` 是小型啟動程式與 MCP 協定端點。`--help`、`--version`、MCP `initialize`、`ping`、`tools/list` 不載入 `autogui_runtime.dll`。第一次 `tools/call` 才載入 DLL；CLI 的實際控制命令也會載入。DLL 在該程序存續期間共用，結束連線時釋放暫停租約，模組本身保持映射至程序結束，以保護 Rust TLS/背景清理。
 
 DLL 包含完整截圖、圖片格式、精確/相似度辨識、Win32、鍵鼠及螢幕保護程式功能；沒有移除圖片格式。不是每張圖片再載入一份 DLL，也沒有從網路下載模組。EXE 只從自身旁邊以絕對路徑載入 DLL，依賴搜尋限制在 DLL 目錄與 Windows System32。不要單獨搬移 EXE。
 
@@ -47,13 +47,13 @@ cargo build --release --workspace --all-features --locked
 
 ## MCP
 
-命令：`autogui-control.exe mcp`，stdio newline JSON-RPC，stdout 僅協定訊息、stderr 診斷，沒有 TCP 連接埠。支援 2024-11-05、2025-03-26、2025-06-18、2025-11-25 版本。先 initialize，再送 notifications/initialized。工具 schema 在 `mcp-tools.json`。
+命令：`autogui-control.exe mcp` 或 `rsgui-decision.exe mcp`，stdio newline JSON-RPC，stdout 僅協定訊息、stderr 診斷，沒有 TCP 連接埠。支援 2024-11-05、2025-03-26、2025-06-18、2025-11-25 版本。先 initialize，再送 notifications/initialized。原生控制工具與決策工具 schema 分別位於套件 `docs/mcp-tools.json`、`docs/decision-tools.json`（原始碼倉庫為 `examples/support/mcp_tools.json` 與 `examples/support/decision_tools.json`）。
 
-提供 14 個工具：`session_status`、`displays_list`、`display_capture`、`window_to_display`、`windows_list`、`window_control`、`capture`、`locate`、`click_image`、`click_at`、`scroll`、`type_text`、`hotkey`、`screensaver`。清單回傳連線專用 target／display；重新列舉會使同類舊參照失效。擷取回傳 PNG image content，不要求宿主另讀本機檔案。輸入送出後仍須確認 App 的實際結果。指定顯示器與選配驅動見 [虛擬顯示器指南](virtual-display.md)。
+提供 19 個工具：`session_status`、`displays_list`、`display_capture`、`window_to_display`、`windows_list`、`window_control`、`capture`、`locate`、`click_image`、`click_at`、`scroll`、`type_text`、`hotkey`、`screensaver`，以及 5 個 bounded decision 工具 `decision_observe`、`decision_evaluate`、`decision_act`、`decision_step`、`decision_status`（預設 `RSGUI_DECISION_MODE=local`，不對外發送網路請求；單一候選為確定性請求，不猜測畫面，詳細契約見 [決策整合指南](decision-integration.md)）。清單回傳連線專用 target／display；重新列舉會使同類舊參照失效。擷取回傳 PNG image content，不要求宿主另讀本機檔案。輸入送出後仍須確認 App 的實際結果。指定顯示器與選配驅動見 [虛擬顯示器指南](virtual-display.md)。
 
 每行最大 1 MiB，超過會關閉連線；待處理佇列 16 筆，滿載時回傳 Server busy，保持連線。搜尋 timeout 最大 30 秒，文字最大 4096 個 Unicode scalar；每段最多 32 個字元，段前檢查取消、EOF 及前景，底層逐字 fail-safe 保留。單次原生呼叫/辨識不能中途撤回，段內失焦可能已有部分文字送出。序列處理桌面輸入，避免多工具互相搶焦點。暫停以專屬子程序持有租約，MCP 消失時管線 EOF 觸發還原；強制終止 helper 後，可由 durable journal 與 `screensaver resume` 恢復。
 
-`click_at {target,capture_id,x,y}` 與 `scroll {target,capture_id,x,y,clicks,horizontal?}` 使用最近一次 `capture` 的 PNG 相對座標及一次性憑證（60 秒過期）。任何嘗試均消耗憑證；其他工具呼叫除 `session_status` 外亦使憑證失效，請操作後重新擷取。輸入前後檢查目標、前景、視窗／顯示器幾何、游標及點周圍最多 32×32 像素。hover 變色時先重新擷取；局部範圍外與最後檢查後的畫面變化仍須由操作者確認。詳見[座標操作說明](recognition-app-control.md#mcp-截圖座標操作與長文字)。
+`click_at {target,capture_id,x,y}` 與 `scroll {target,capture_id,x,y,clicks,horizontal?}` 使用最近一次 `capture`（會喚起視窗）或 `decision_observe`（不搶焦點的被動前景擷取）的 PNG 相對座標及一次性憑證（60 秒過期）。任何執行或無效嘗試均消耗憑證；其他工具呼叫除 `session_status`、`decision_status` 外亦會使憑證失效（`decision_evaluate` 驗證並產生待授權 `decision_id` 時保留 `capture_id` 供後續 `decision_act` 使用），請操作後重新擷取。輸入前後檢查目標、前景、視窗／顯示器幾何、游標及點周圍最多 32×32 像素。hover 變色時先重新擷取；局部範圍外與最後檢查後的畫面變化仍須由操作者確認。詳見[座標操作說明](recognition-app-control.md#mcp-截圖座標操作與長文字)。
 
 ## Windows API
 

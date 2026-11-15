@@ -91,16 +91,92 @@ fn capture_region(
     }
 }
 
+pub(crate) struct PauseGuard<'a> {
+    gui: &'a mut AutoGui,
+    saved: Duration,
+}
+
+impl<'a> PauseGuard<'a> {
+    pub(crate) fn zero(gui: &'a mut AutoGui) -> Self {
+        let saved = gui.settings().pause;
+        gui.settings_mut().pause = Duration::ZERO;
+        Self { gui, saved }
+    }
+
+    pub(crate) fn gui(&mut self) -> &mut AutoGui {
+        self.gui
+    }
+}
+
+impl Drop for PauseGuard<'_> {
+    fn drop(&mut self) {
+        self.gui.settings_mut().pause = self.saved;
+    }
+}
+
+pub(crate) fn move_cursor_and_wait(
+    gui: &mut AutoGui,
+    display: Option<&Display>,
+    point: Point,
+    check: &dyn Fn() -> autogui::Result<()>,
+) -> autogui::Result<()> {
+    check()?;
+    let mut guard = PauseGuard::zero(gui);
+    if let Some(display) = display {
+        guard.gui().move_to_display(display, point)?;
+    } else {
+        guard.gui().move_to_xy(point.x, point.y)?;
+        let start = Instant::now();
+        while guard.gui().position()? != point {
+            check()?;
+            if start.elapsed() >= Duration::from_millis(100) {
+                return Err(Error::Input(
+                    "cursor did not reach target point; no click sent".into(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn template_dimensions_fit(
+    width: u32,
+    height: u32,
+    scale: f64,
+) -> autogui::Result<(u32, u32)> {
+    const MAX_TEMPLATE_PIXELS: u64 = 4_194_304;
+    if u64::from(width) * u64::from(height) > MAX_TEMPLATE_PIXELS {
+        return Err(Error::InvalidArgument("template exceeds 4 megapixels"));
+    }
+    if scale == 1.0 {
+        return Ok((width, height));
+    }
+    let scaled_w = (f64::from(width) * scale).round().max(1.0);
+    let scaled_h = (f64::from(height) * scale).round().max(1.0);
+    if scaled_w > f64::from(u32::MAX) || scaled_h > f64::from(u32::MAX) {
+        return Err(Error::InvalidArgument("template exceeds 4 megapixels"));
+    }
+    let scaled_w = scaled_w as u32;
+    let scaled_h = scaled_h as u32;
+    if u64::from(scaled_w) * u64::from(scaled_h) > MAX_TEMPLATE_PIXELS {
+        return Err(Error::InvalidArgument("template exceeds 4 megapixels"));
+    }
+    Ok((scaled_w, scaled_h))
+}
+
 fn scaled_template(path: &str, scale: f64) -> autogui::Result<Screenshot> {
     if !(0.1..=4.0).contains(&scale) {
         return Err(Error::InvalidArgument("scale must be between 0.1 and 4.0"));
     }
+    if let Ok((width, height)) = image::image_dimensions(path) {
+        template_dimensions_fit(width, height, scale)?;
+    }
     let image = Screenshot::load(path)?;
+    let (width, height) = template_dimensions_fit(image.width, image.height, scale)?;
     if scale == 1.0 {
         return Ok(image);
     }
-    let width = (f64::from(image.width) * scale).round().max(1.0) as u32;
-    let height = (f64::from(image.height) * scale).round().max(1.0) as u32;
     let rgb = image::RgbImage::from_raw(image.width, image.height, image.pixels)
         .ok_or(Error::InvalidArgument("invalid template image"))?;
     let scaled =
@@ -155,11 +231,74 @@ fn locate_target(
     }
 }
 
+fn extract_display_name(args: &mut Vec<String>) -> autogui::Result<Option<String>> {
+    if !matches!(
+        args.first().map(String::as_str),
+        Some("capture" | "locate" | "click")
+    ) {
+        return Ok(None);
+    }
+    let Some(index) = args
+        .iter()
+        .enumerate()
+        .skip(3)
+        .find_map(|(i, s)| (s == "--display").then_some(i))
+    else {
+        return Ok(None);
+    };
+    if index + 2 != args.len() {
+        return Err(Error::InvalidArgument(
+            "--display <exact device name> must be the final option",
+        ));
+    }
+    let name = args[index + 1].clone();
+    args.truncate(index);
+    Ok(Some(name))
+}
+
+fn validate_command_args(args: &[String]) -> autogui::Result<()> {
+    let command = args[0].as_str();
+    match command {
+        "list" => {
+            if args.len() > 2 {
+                return Err(Error::InvalidArgument(
+                    "list accepts at most one optional title",
+                ));
+            }
+        }
+        "capture" => {
+            if args.len() != 3 {
+                return Err(Error::InvalidArgument(
+                    "capture requires <title> <output.png>",
+                ));
+            }
+        }
+        "type" => {
+            if args.len() != 3 {
+                return Err(Error::InvalidArgument("type requires <title> <text>"));
+            }
+            if args[2].contains('\0') {
+                return Err(Error::InvalidArgument("text must not contain NUL bytes"));
+            }
+        }
+        "locate" | "click" => {
+            if !(3..=6).contains(&args.len()) {
+                return Err(Error::InvalidArgument(
+                    "locate/click accept <title> <template.png> [confidence|exact] [timeout] [scale]",
+                ));
+            }
+        }
+        "screensaver" => {}
+        _ => return Err(Error::InvalidArgument("unknown command; use --help")),
+    }
+    Ok(())
+}
+
 fn run() -> autogui::Result<()> {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    if args.is_empty() || args[0] == "--help" {
+    if args.is_empty() || (args.len() == 1 && matches!(args[0].as_str(), "--help" | "-h")) {
         println!(
-            "用法：app_control list [標題]\n      app_control capture <標題> <output.png>\n      app_control locate <標題> <template.png> [confidence|exact] [timeout秒] [scale]\n      app_control click <標題> <template.png> [confidence|exact] [timeout秒] [scale]\n      app_control type <標題> <文字>\n\n標題使用不分大小寫的子字串；必須只符合一個視窗。\n預設 confidence=0.95、timeout=5、scale=1。\ncapture／locate／click／type 會啟用目標視窗；click／type 送出真實輸入。\n把游標移到主螢幕角落可中止。相似度模式需 --features opencv。 "
+            "用法：app_control list [標題]\n      app_control capture <標題> <output.png>\n      app_control locate <標題> <template.png> [confidence|exact] [timeout秒] [scale]\n      app_control click <標題> <template.png> [confidence|exact] [timeout秒] [scale]\n      app_control type <標題> <文字>\n      app_control --version\n\n標題使用不分大小寫的子字串；必須只符合一個視窗。\n預設 confidence=0.95、timeout=5、scale=1。\ncapture／locate／click／type 會啟用目標視窗；click／type 送出真實輸入。\n把游標移到主螢幕角落可中止。相似度模式需 --features opencv。 "
         );
         println!(
             "\n螢幕保護程式：\n      app_control screensaver status\n      app_control screensaver pause [秒數，預設 900，最多 86400]\n      app_control screensaver resume\n      app_control screensaver stop\n\npause 等待到期、Ctrl+C 或 resume 後還原原設定；不改動密碼或鎖定原則。\nstop 只關閉正在執行的螢幕保護程式，不會解除 Windows 鎖定。"
@@ -177,6 +316,10 @@ fn run() -> autogui::Result<()> {
         );
         return Ok(());
     }
+    if args.len() == 1 && matches!(args[0].as_str(), "--version" | "-V") {
+        println!("app_control {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     #[cfg(feature = "agent")]
     if args[0] == "mcp" && args.len() == 1 {
         return mcp::run(mcp_tools::Session::default()).map_err(Error::Io);
@@ -191,36 +334,13 @@ fn run() -> autogui::Result<()> {
     if args[0] == "session" {
         return session::run(&args[1..]);
     }
-    let display = if matches!(args[0].as_str(), "capture" | "locate" | "click") {
-        if let Some(index) = args
-            .iter()
-            .enumerate()
-            .skip(3)
-            .find_map(|(i, s)| (s == "--display").then_some(i))
-        {
-            if index + 2 != args.len() {
-                return Err(Error::InvalidArgument(
-                    "--display <exact device name> must be the final option",
-                ));
-            }
-            let display = display_command::select(&args[index + 1])?;
-            args.truncate(index);
-            Some(display)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let display_name = extract_display_name(&mut args)?;
+    validate_command_args(&args)?;
+    let display = display_name
+        .as_deref()
+        .map(display_command::select)
+        .transpose()?;
     let command = args[0].as_str();
-    if !["list", "capture", "locate", "click", "type", "screensaver"].contains(&command) {
-        return Err(Error::InvalidArgument("unknown command; use --help"));
-    }
-    if command != "list" && command != "screensaver" && args.len() < 3 {
-        return Err(Error::InvalidArgument(
-            "missing title or image/text argument; use --help",
-        ));
-    }
     if !cfg!(windows) {
         return Err(Error::UnsupportedPlatform);
     }
@@ -323,19 +443,17 @@ fn run() -> autogui::Result<()> {
                         "target window moved; retry recognition",
                     ));
                 }
+                move_cursor_and_wait(&mut gui, display.as_ref(), point, &|| Ok(()))?;
+                active(&window)?;
                 if let Some(display) = &display {
-                    gui.move_to_display(display, point)?;
-                    active(&window)?;
                     display.validate()?;
-                    if window.box_rect()? != captured_window || gui.position()? != point {
-                        return Err(Error::InvalidArgument(
-                            "target or cursor moved before click; retry recognition",
-                        ));
-                    }
-                    gui.click()?;
-                } else {
-                    gui.click_xy(point.x, point.y)?;
                 }
+                if window.box_rect()? != captured_window || gui.position()? != point {
+                    return Err(Error::InvalidArgument(
+                        "target or cursor moved before click; retry recognition",
+                    ));
+                }
+                gui.click()?;
             }
             println!(
                 "{} {:?}, center {:?}, window {}",
@@ -354,5 +472,54 @@ pub fn main() {
     if let Err(error) = run() {
         eprintln!("操作失敗：{error}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vec_args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn cli_rejects_trailing_args_and_nul_text() {
+        for bad in [
+            vec_args(&["list", "title", "extra"]),
+            vec_args(&["capture", "title", "out.png", "extra"]),
+            vec_args(&["type", "title", "hello", "extra"]),
+            vec_args(&["type", "title", "a\0b"]),
+            vec_args(&["locate", "title", "tpl.png", "0.9", "5", "1", "extra"]),
+            vec_args(&["click", "title", "tpl.png", "exact", "5", "1", "extra"]),
+        ] {
+            let mut args = bad;
+            let _ = extract_display_name(&mut args).unwrap();
+            assert!(validate_command_args(&args).is_err(), "{args:?}");
+        }
+        let mut with_display =
+            vec_args(&["capture", "title", "out.png", "--display", r"\\.\DISPLAY2"]);
+        assert_eq!(
+            extract_display_name(&mut with_display).unwrap().as_deref(),
+            Some(r"\\.\DISPLAY2")
+        );
+        assert!(validate_command_args(&with_display).is_ok());
+
+        let mut trailing_after_display = vec_args(&[
+            "capture",
+            "title",
+            "out.png",
+            "--display",
+            r"\\.\DISPLAY2",
+            "extra",
+        ]);
+        assert!(extract_display_name(&mut trailing_after_display).is_err());
+    }
+
+    #[test]
+    fn template_dimensions_checked_before_decode() {
+        assert!(template_dimensions_fit(4096, 1024, 1.0).is_ok());
+        assert!(template_dimensions_fit(4097, 1024, 1.0).is_err());
+        assert!(template_dimensions_fit(2048, 2048, 1.1).is_err());
     }
 }

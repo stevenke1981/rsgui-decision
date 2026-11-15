@@ -4,7 +4,8 @@ param([Parameter(Mandatory=$true)][string]$Manifest)
 $ErrorActionPreference = 'Stop'
 $utf8 = New-Object Text.UTF8Encoding($false)
 function FullPath([string]$Path) {
-    $full = [IO.Path]::GetFullPath($Path)
+    $base = (Get-Location -PSProvider FileSystem).ProviderPath
+    $full = if ([IO.Path]::IsPathRooted($Path)) { [IO.Path]::GetFullPath($Path) } else { [IO.Path]::GetFullPath((Join-Path $base $Path)) }
     if ($full.Length -gt [IO.Path]::GetPathRoot($full).Length) { $full = $full.TrimEnd('\') }
     $full
 }
@@ -72,7 +73,7 @@ try {
         } else { Remove-Item -LiteralPath $record.path -Force }
     }
     $data.state = 'restored'
-    $data | Add-Member -NotePropertyName restored_at -NotePropertyValue (Get-Date -Format 'o')
+    $data | Add-Member -Force -NotePropertyName restored_at -NotePropertyValue (Get-Date -Format 'o')
     [IO.File]::WriteAllText($Manifest, ($data | ConvertTo-Json -Depth 8), $utf8)
 } catch {
     $failure = $_.Exception.Message

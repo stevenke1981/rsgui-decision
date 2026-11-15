@@ -2,11 +2,40 @@
 [CmdletBinding()]
 param([Parameter(Mandatory=$true)][string]$PackageRoot)
 $ErrorActionPreference='Stop'
+if (-not [IO.Path]::IsPathRooted($PackageRoot)) {
+    $PackageRoot=[IO.Path]::GetFullPath((Join-Path (Get-Location -PSProvider FileSystem).ProviderPath $PackageRoot))
+}
 $repo=Split-Path -Parent $PSScriptRoot
-$fixture=Join-Path $repo ('.agent\install-test-'+[guid]::NewGuid().ToString('N'))
+$agentRoot=Join-Path $repo '.agent'
+$agentRootExisted=Test-Path -LiteralPath $agentRoot
+$fixture=Join-Path $agentRoot ('install-test-'+[guid]::NewGuid().ToString('N'))
 $profile=Join-Path $fixture 'profile'
 $install=Join-Path $fixture 'program'
+$originalPath=$env:PATH
+try {
 New-Item -ItemType Directory -Path $profile -Force | Out-Null
+if (-not (Get-Command codex -ErrorAction SilentlyContinue)) {
+    $codexShimDir=Join-Path $fixture 'codex-shim'
+    New-Item -ItemType Directory -Path $codexShimDir -Force | Out-Null
+    $codexShim=@(
+        '@echo off',
+        'if "%~1"=="mcp" if "%~2"=="list" (',
+        '  if exist "%CODEX_HOME%\config.toml" (',
+        '    findstr /L /C:"[mcp_servers.autogui]" "%CODEX_HOME%\config.toml" >nul 2>nul && (echo [{"name":"autogui"}]& exit /b 0)',
+        '  )',
+        '  echo []',
+        '  exit /b 0',
+        ')',
+        'if "%~1"=="mcp" if "%~2"=="add" (',
+        '  if not exist "%CODEX_HOME%" mkdir "%CODEX_HOME%" >nul 2>nul',
+        '  >>"%CODEX_HOME%\config.toml" (echo.& echo [mcp_servers.autogui]& echo command = "%~5")',
+        '  exit /b 0',
+        ')',
+        'exit /b 1'
+    ) -join "`r`n"
+    [IO.File]::WriteAllText((Join-Path $codexShimDir 'codex.cmd'), $codexShim + "`r`n", [Text.Encoding]::ASCII)
+    $env:PATH="$codexShimDir;$originalPath"
+}
 function Assert($Condition,[string]$Message) { if (-not $Condition) { throw $Message } }
 $utf8=New-Object System.Text.UTF8Encoding($false)
 $originals=@{
@@ -33,14 +62,14 @@ Assert (Test-Path -LiteralPath (Join-Path $install 'autogui_runtime.dll')) 'Runt
 foreach($relative in @('.codex\skills','.claude\skills','.config\opencode\skills','.gemini\config\skills')) {
     $root=Join-Path $profile "$relative\autogui-control"
     Assert (Test-Path -LiteralPath (Join-Path $root 'SKILL.md')) "Missing Skill $relative"
-    $runtime=Get-Content -LiteralPath (Join-Path $root 'runtime.json') -Raw | ConvertFrom-Json
+    $runtime=Get-Content -LiteralPath (Join-Path $root 'runtime.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert ($runtime.executable -eq (Join-Path $install 'autogui-control.exe')) 'Wrong Skill runtime path'
 }
 Assert (-not (Test-Path -LiteralPath (Join-Path $profile '.gemini\antigravity-cli\skills'))) 'Default AGY Skill used legacy root'
-$claude=Get-Content -LiteralPath (Join-Path $profile '.claude.json') -Raw | ConvertFrom-Json
+$claude=Get-Content -LiteralPath (Join-Path $profile '.claude.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert ($claude.theme -eq 'dark' -and $claude.mcpServers.fixture.command -eq 'not-started') 'Unrelated Claude config lost'
 Assert ($claude.mcpServers.autogui.args[0] -eq 'mcp') 'Claude MCP args wrong'
-$agy=Get-Content -LiteralPath (Join-Path $profile '.gemini\config\mcp_config.json') -Raw | ConvertFrom-Json
+$agy=Get-Content -LiteralPath (Join-Path $profile '.gemini\config\mcp_config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 Assert ($agy.other -and $agy.mcpServers.fixture.command -eq 'unused') 'Unrelated AGY config lost'
 Assert ($agy.mcpServers.autogui.command -eq (Join-Path $install 'autogui-control.exe') -and $agy.mcpServers.autogui.args[0] -eq 'mcp') 'AGY MCP definition wrong'
 $oc=[IO.File]::ReadAllText((Join-Path $profile '.config\opencode\opencode.jsonc'))
@@ -102,9 +131,9 @@ foreach($case in @(
     Assert (-not (Test-Path -LiteralPath $blankInstall)) "Preview wrote program files for $($case.Name) config"
     Assert ([Convert]::ToBase64String([IO.File]::ReadAllBytes($blankConfig)) -ceq $originalBytes) "Preview changed $($case.Name) config"
     & (Join-Path $PackageRoot 'install.ps1') -HomeDirectory $blankProfile -InstallDir $blankInstall -McpHosts agy -NonInteractive
-    $blankParsed=Get-Content -LiteralPath $blankConfig -Raw | ConvertFrom-Json
+    $blankParsed=Get-Content -LiteralPath $blankConfig -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert ($null -ne $blankParsed -and $blankParsed.mcpServers.autogui.command -eq (Join-Path $blankInstall 'autogui-control.exe')) "$($case.Name) config was not installed as an object"
-    $blankManifest=Get-Content -LiteralPath (Join-Path $blankInstall '.install\manifest.json') -Raw | ConvertFrom-Json
+    $blankManifest=Get-Content -LiteralPath (Join-Path $blankInstall '.install\manifest.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     $configRecord=@($blankManifest.files | Where-Object path -EQ $blankConfig)
     Assert ($configRecord.Count -eq 1 -and (Test-Path -LiteralPath $configRecord[0].backup)) "Original backup missing for $($case.Name) config"
     Assert ([Convert]::ToBase64String([IO.File]::ReadAllBytes($configRecord[0].backup)) -ceq $originalBytes) "Original backup bytes changed for $($case.Name) config"
@@ -132,7 +161,7 @@ foreach($case in @(
     & (Join-Path $PackageRoot 'install.ps1') -HomeDirectory $overrideProfile -InstallDir $overrideInstall -SkillHosts agy -AgySkillRoot $overrideRoot -NonInteractive
     $overrideSkill=Join-Path $overrideRoot 'autogui-control'
     Assert (Test-Path -LiteralPath (Join-Path $overrideSkill 'SKILL.md')) "AGY $($case.Name) Skill root ignored"
-    $overrideRuntime=Get-Content -LiteralPath (Join-Path $overrideSkill 'runtime.json') -Raw | ConvertFrom-Json
+    $overrideRuntime=Get-Content -LiteralPath (Join-Path $overrideSkill 'runtime.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     Assert ($overrideRuntime.executable -eq (Join-Path $overrideInstall 'autogui-control.exe')) 'Override Skill runtime path wrong'
     Assert (-not (Test-Path -LiteralPath (Join-Path $overrideProfile '.gemini\config'))) 'AGY Skill override wrote default root or MCP config'
     & (Join-Path $overrideInstall 'uninstall.ps1')
@@ -140,3 +169,10 @@ foreach($case in @(
     Assert ([IO.File]::ReadAllText($unrelatedSkill) -ceq 'fixture: preserve this skill') 'Unrelated override Skill changed'
 }
 Write-Host "PASS installer: all four hosts, JSONC preservation, byte-exact empty/whitespace backups and restoration, shared/legacy/custom AGY Skill roots, program-only, collision, isolated root $fixture"
+} finally {
+    $env:PATH=$originalPath
+    if (Test-Path -LiteralPath $fixture) { Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue }
+    if (-not $agentRootExisted -and (Test-Path -LiteralPath $agentRoot) -and @((Get-ChildItem -LiteralPath $agentRoot -Force)).Count -eq 0) {
+        Remove-Item -LiteralPath $agentRoot -Force -ErrorAction SilentlyContinue
+    }
+}

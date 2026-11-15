@@ -1,6 +1,6 @@
 use super::{
-    active, capture_region, display_command, locate_target, scaled_template, screen_region,
-    session, window_command,
+    PauseGuard, active, capture_region, display_command, locate_target, scaled_template,
+    screen_region, session, window_command,
 };
 use autogui::{AutoGui, Display, Error, LocateOptions, Rect, Result, Screenshot, Window};
 #[path = "mcp_decision.rs"]
@@ -25,20 +25,38 @@ fn rect(rect: Rect) -> Value {
 fn display_info(display: &Display) -> Value {
     json!({"device_name":display.name(),"friendly_name":display.friendly_name(),"id":display.id(),"rect":rect(display.bounds()),"primary":display.is_primary(),"coordinates":"windows desktop physical pixels"})
 }
-fn png(frame: Screenshot, metadata: Value) -> Result<Value> {
-    let rgb = image::RgbImage::from_raw(frame.width, frame.height, frame.pixels)
-        .ok_or(Error::InvalidArgument("invalid frame"))?;
-    let mut bytes = std::io::Cursor::new(Vec::new());
-    rgb.write_to(&mut bytes, image::ImageFormat::Png)
+pub(super) fn encode_png_base64(frame: &Screenshot) -> Result<String> {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    use image::{ExtendedColorType, ImageEncoder};
+
+    let expected = usize::try_from(frame.width)
+        .ok()
+        .and_then(|w| w.checked_mul(usize::try_from(frame.height).ok()?))
+        .and_then(|px| px.checked_mul(3));
+    if expected != Some(frame.pixels.len()) {
+        return Err(Error::InvalidArgument("invalid frame"));
+    }
+    let mut bytes = Vec::new();
+    PngEncoder::new_with_quality(&mut bytes, CompressionType::Fast, FilterType::Adaptive)
+        .write_image(
+            &frame.pixels,
+            frame.width,
+            frame.height,
+            ExtendedColorType::Rgb8,
+        )
         .map_err(|e| Error::Screenshot(e.to_string()))?;
-    if bytes.get_ref().len() > 12 * 1024 * 1024 {
+    if bytes.len() > 12 * 1024 * 1024 {
         return Err(Error::InvalidArgument(
             "PNG exceeds 12 MiB; request a smaller region",
         ));
     }
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+fn png(frame: &Screenshot, metadata: Value) -> Result<Value> {
+    let data = encode_png_base64(frame)?;
     Ok(
         json!({"content":[{"type":"text","text":metadata.to_string()},
-        {"type":"image","mimeType":"image/png","data":base64::engine::general_purpose::STANDARD.encode(bytes.into_inner())}],"isError":false}),
+        {"type":"image","mimeType":"image/png","data":data}],"isError":false}),
     )
 }
 fn info(window: &Window) -> Result<Value> {
@@ -251,7 +269,7 @@ impl Session {
                 let frame = self.gui()?.screenshot_display_region(&display, region)?;
                 check()?;
                 png(
-                    frame,
+                    &frame,
                     json!({"display":a.display,"device_name":display.name(),"region":rect(region),"coordinates":"windows desktop physical pixels"}),
                 )
             }
@@ -362,11 +380,11 @@ impl Session {
                     .checked_add(1)
                     .ok_or(Error::InvalidArgument("restart session"))?;
                 let id = format!("c{}", self.capture_generation);
-                let taken = Instant::now();
                 let output = png(
-                    frame.clone(),
+                    &frame,
                     json!({"target":a.target,"display":a.display,"region":rect(region),"coordinates":"windows desktop physical pixels","capture_id":id,"pointer_coordinates":"image-relative pixels; origin at captured image top-left","expires_in_seconds":60,"single_use":true}),
                 )?;
+                let taken = Instant::now();
                 self.capture = Some(CaptureProof {
                     id,
                     target: a.target,
@@ -409,19 +427,20 @@ impl Session {
                     .map(|key| self.display(key))
                     .transpose()?;
                 let gui = self.gui()?;
-                proof.verify(gui, &window, display.as_ref(), point, check)?;
-                if let Some(display) = &display {
-                    gui.move_to_display(display, point)?;
-                } else {
-                    gui.move_to_xy(point.x, point.y)?;
-                }
-                proof.verify(gui, &window, display.as_ref(), point, check)?;
-                let actual = gui.position()?;
-                if actual != point {
-                    eprintln!("autogui pointer readback: expected={point:?}, actual={actual:?}");
-                    return Err(Error::InvalidArgument(
-                        "cursor moved before input; capture again",
-                    ));
+                {
+                    let mut guard = super::PauseGuard::zero(gui);
+                    proof.verify(guard.gui(), &window, display.as_ref(), point, check)?;
+                    super::move_cursor_and_wait(guard.gui(), display.as_ref(), point, check)?;
+                    proof.verify(guard.gui(), &window, display.as_ref(), point, check)?;
+                    let actual = guard.gui().position()?;
+                    if actual != point {
+                        eprintln!(
+                            "autogui pointer readback: expected={point:?}, actual={actual:?}"
+                        );
+                        return Err(Error::InvalidArgument(
+                            "cursor moved before input; capture again",
+                        ));
+                    }
                 }
                 match scroll {
                     Some((clicks, true)) => gui.hscroll(clicks)?,
@@ -501,20 +520,18 @@ impl Session {
                     if window.box_rect()? != bounds {
                         return Err(Error::InvalidArgument("window moved; retry recognition"));
                     }
+                    super::move_cursor_and_wait(gui, display.as_ref(), point, check)?;
+                    check()?;
+                    active(&window)?;
                     if let Some(display) = &display {
-                        gui.move_to_display(display, point)?;
-                        check()?;
-                        active(&window)?;
                         display.validate()?;
-                        if window.box_rect()? != bounds || gui.position()? != point {
-                            return Err(Error::InvalidArgument(
-                                "target or cursor moved before click; retry recognition",
-                            ));
-                        }
-                        gui.click()?;
-                    } else {
-                        gui.click_xy(point.x, point.y)?;
                     }
+                    if window.box_rect()? != bounds || gui.position()? != point {
+                        return Err(Error::InvalidArgument(
+                            "target or cursor moved before click; retry recognition",
+                        ));
+                    }
+                    gui.click()?;
                 }
                 Ok(text(
                     json!({"rect":rect(found),"center":{"x":point.x,"y":point.y},"clicked":name=="click_image","display":a.display,"coordinates":"windows desktop physical pixels"}),
@@ -522,12 +539,8 @@ impl Session {
             }
             "type_text" | "type_text_passive" => {
                 let a: TypeText = decode(args)?;
+                input::validate_type_text(&a.text, 0)?;
                 let count = a.text.chars().count();
-                if count > 4096 {
-                    return Err(Error::InvalidArgument(
-                        "text exceeds 4096 characters; send smaller chunks",
-                    ));
-                }
                 let window = self.target(&a.target)?;
                 check()?;
                 if name == "type_text" {
@@ -544,14 +557,7 @@ impl Session {
             }
             "hotkey" | "hotkey_passive" => {
                 let a: Hotkey = decode(args)?;
-                if a.keys.is_empty()
-                    || a.keys.len() > 8
-                    || a.keys.iter().any(|k| k.is_empty() || k.len() > 32)
-                {
-                    return Err(Error::InvalidArgument(
-                        "use 1..8 canonical keys, e.g. ctrl,a or enter",
-                    ));
-                }
+                input::validate_hotkey(&a.keys)?;
                 let window = self.target(&a.target)?;
                 check()?;
                 if name == "hotkey" {
@@ -783,5 +789,25 @@ mod tests {
             assert!(s.capture.is_none());
             assert!(s.gui.is_none());
         }
+    }
+
+    #[test]
+    fn encode_png_base64_encodes_valid_png_without_cloning_buffer() {
+        let frame = Screenshot::solid(16, 12, autogui::Rgb::new(10, 20, 30));
+        let b64 = encode_png_base64(&frame).unwrap();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+
+        let bad = Screenshot {
+            width: 16,
+            height: 12,
+            pixels: vec![0; 10],
+        };
+        assert!(matches!(
+            encode_png_base64(&bad),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 }

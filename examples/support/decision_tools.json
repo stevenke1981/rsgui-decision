@@ -98,7 +98,10 @@
                       "clicks": {
                         "type": "integer",
                         "minimum": -100,
-                        "maximum": 100
+                        "maximum": 100,
+                        "not": {
+                          "const": 0
+                        }
                       },
                       "horizontal": {
                         "type": "boolean"
@@ -310,7 +313,10 @@
                           "clicks": {
                             "type": "integer",
                             "minimum": -100,
-                            "maximum": 100
+                            "maximum": 100,
+                            "not": {
+                              "const": 0
+                            }
                           },
                           "horizontal": {
                             "type": "boolean"

@@ -30,23 +30,30 @@ impl Default for LocateOptions {
 fn pixel_eq(hay: &Screenshot, needle: &Screenshot, x: i32, y: i32, gray: bool) -> bool {
     let hay_stride = hay.width as usize * 3;
     let needle_stride = needle.width as usize * 3;
-    for ny in 0..needle.height as i32 {
-        let hay_start = (y as usize + ny as usize) * hay_stride + x as usize * 3;
-        let needle_start = ny as usize * needle_stride;
-        for nx in 0..needle.width as i32 {
-            let h = hay_start + nx as usize * 3;
-            let n = needle_start + nx as usize * 3;
-            let (Some(hp), Some(np)) = (hay.pixels.get(h..h + 3), needle.pixels.get(n..n + 3))
-            else {
-                return false;
-            };
-            if gray {
-                if luma(hp) != luma(np) {
-                    return false;
-                }
-            } else if hp != np {
+    let x_offset = x as usize * 3;
+    for ny in 0..needle.height as usize {
+        let hay_start = (y as usize + ny) * hay_stride + x_offset;
+        let needle_start = ny * needle_stride;
+        let (Some(h_row), Some(n_row)) = (
+            hay.pixels.get(hay_start..hay_start + needle_stride),
+            needle
+                .pixels
+                .get(needle_start..needle_start + needle_stride),
+        ) else {
+            return false;
+        };
+        if gray {
+            if h_row
+                .as_chunks::<3>()
+                .0
+                .iter()
+                .zip(n_row.as_chunks::<3>().0.iter())
+                .any(|(hp, np)| luma(hp) != luma(np))
+            {
                 return false;
             }
+        } else if h_row != n_row {
+            return false;
         }
     }
     true
@@ -466,8 +473,10 @@ mod tests {
     fn confidence_needs_feature() {
         let hay = Screenshot::solid(8, 8, Rgb::new(0, 0, 0));
         let needle = Screenshot::solid(2, 2, Rgb::new(0, 0, 0));
-        let mut opt = LocateOptions::default();
-        opt.confidence = Some(0.9);
+        let opt = LocateOptions {
+            confidence: Some(0.9),
+            ..LocateOptions::default()
+        };
         let err = locate_in(&needle, &hay, &opt, true).unwrap_err();
         assert!(matches!(err, Error::FeatureDisabled(_)));
     }
@@ -496,5 +505,30 @@ mod tests {
         };
         let found = locate_in(&needle, &hay, &options, true).unwrap().unwrap();
         assert_eq!(found, Rect::new(5, 3, 4, 4));
+    }
+
+    #[cfg(feature = "opencv")]
+    #[test]
+    fn fft_single_active_rgb_channel_and_flat_template() {
+        let mut hay = Screenshot::solid(150, 100, Rgb::new(20, 40, 60));
+        let mut needle = Screenshot::solid(40, 20, Rgb::new(0, 40, 60));
+        for y in 0..20 {
+            for x in 0..40 {
+                let r = ((x * 13 + y * 29) % 250) as u8;
+                needle.set_pixel(x, y, Rgb::new(r, 40, 60)).unwrap();
+                hay.set_pixel(x + 70, y + 50, Rgb::new(r, 40, 60)).unwrap();
+            }
+        }
+        let found = locate_in(
+            &needle,
+            &hay,
+            &LocateOptions {
+                confidence: Some(0.99),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(found, Some(Rect::new(70, 50, 40, 20)));
     }
 }
