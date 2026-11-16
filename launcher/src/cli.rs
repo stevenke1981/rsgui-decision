@@ -24,8 +24,8 @@ Primary-monitor corner fail-safe remains enabled.\n\
 Titles must match one window. close requests WM_CLOSE; it does not confirm exit.\n\n\
 Rust decision integration: decision_observe, decision_evaluate, decision_act, decision_step, decision_status (MCP).\n\
 One stored action + adaptive wait + fresh capture per step.\n\
-RSGUI_DECISION_MODE=local (default), auto, or gemini.\n\
-Remote modes send selected window pixels to Google; explicitly configure GEMINI_API_KEY.\n\
+RSGUI_DECISION_MODE=auto (default), local, or gemini.\n\
+Remote modes prioritize Gemini Decision 1 when available and send selected window pixels to Google (set GEMINI_API_KEY).\n\
 --version works without loading the runtime."
     )
 }

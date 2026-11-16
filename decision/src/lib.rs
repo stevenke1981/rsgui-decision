@@ -3,8 +3,11 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::ffi::OsStr;
 use std::fmt;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
+use std::path::Path;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -16,6 +19,8 @@ use thiserror::Error;
 
 const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/decisions";
 const MODEL: &str = "gemini-decision-1";
+const SIDECAR_PORT: u16 = 8792;
+const SIDECAR_PROBE_TIMEOUT: Duration = Duration::from_millis(25);
 const CATCHALLS: [&str; 4] = ["observe", "wait", "stop", "done"];
 // Matches the desktop executor's 12 MiB PNG ceiling after base64 expansion.
 const MAX_IMAGE_BASE64: usize = 16 * 1024 * 1024;
@@ -213,9 +218,84 @@ impl Provider {
     }
 }
 
+/// Discovered availability of `gemini-decision-1` without exposing credentials.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GeminiDiscovery {
+    pub api_key_configured: bool,
+    pub gemini_core_cli: bool,
+    pub sidecar_healthy: bool,
+    pub available: bool,
+}
+
+impl GeminiDiscovery {
+    fn finalize(mut self) -> Self {
+        self.available = self.api_key_configured || self.gemini_core_cli || self.sidecar_healthy;
+        self
+    }
+}
+
+/// Directive returned by a [`DecisionHook`] before evaluation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HookDirective {
+    Continue,
+    PreferGemini,
+    UseLocal,
+}
+
+/// Read-only context supplied to a [`DecisionHook`].
+pub struct DecisionHookContext<'a> {
+    pub mode: Mode,
+    pub discovery: &'a GeminiDiscovery,
+    pub input: &'a DecisionInput,
+    pub provider_configured: bool,
+}
+
+/// Extension hook evaluated around [`Engine::evaluate`] and image-need checks.
+pub trait DecisionHook: Send {
+    fn name(&self) -> &'static str;
+
+    fn before_evaluate(&self, ctx: &DecisionHookContext<'_>) -> HookDirective {
+        let _ = ctx;
+        HookDirective::Continue
+    }
+
+    fn after_evaluate(&self, ctx: &DecisionHookContext<'_>, decision: &Decision) {
+        let _ = (ctx, decision);
+    }
+}
+
+/// Prioritizes Gemini Decision 1 whenever an API provider exists outside `Mode::Local`.
+/// Single-candidate `Facts::Ready` calls remain deterministic unless `evaluate_ready` is set.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PreferGeminiDecisionHook {
+    pub evaluate_ready: bool,
+}
+
+impl DecisionHook for PreferGeminiDecisionHook {
+    fn name(&self) -> &'static str {
+        "prefer_gemini_decision_1"
+    }
+
+    fn before_evaluate(&self, ctx: &DecisionHookContext<'_>) -> HookDirective {
+        if ctx.mode == Mode::Local {
+            return HookDirective::UseLocal;
+        }
+        if ctx.provider_configured
+            && (ctx.input.facts == Facts::Unknown
+                || (self.evaluate_ready && matches!(ctx.input.facts, Facts::Ready { .. })))
+        {
+            return HookDirective::PreferGemini;
+        }
+        HookDirective::Continue
+    }
+}
+
 pub struct Engine {
     mode: Mode,
     provider: Option<Provider>,
+    discovery: GeminiDiscovery,
+    hook: Box<dyn DecisionHook>,
 }
 
 impl Engine {
@@ -223,18 +303,62 @@ impl Engine {
         Self {
             mode: Mode::Local,
             provider: None,
+            discovery: GeminiDiscovery::default(),
+            hook: Box::new(PreferGeminiDecisionHook::default()),
         }
     }
 
-    /// Defaults to local. Remote use requires explicit `RSGUI_DECISION_MODE=auto|gemini`.
+    #[cfg(test)]
+    fn without_provider(mode: Mode) -> Self {
+        Self {
+            mode,
+            provider: None,
+            discovery: GeminiDiscovery::default(),
+            hook: Box::new(PreferGeminiDecisionHook::default()),
+        }
+    }
+
+    pub fn with_hook(mut self, hook: impl DecisionHook + 'static) -> Self {
+        self.hook = Box::new(hook);
+        self
+    }
+
+    pub fn set_hook(&mut self, hook: impl DecisionHook + 'static) {
+        self.hook = Box::new(hook);
+    }
+
+    pub fn has_provider(&self) -> bool {
+        self.provider.is_some()
+    }
+
+    pub fn discovery(&self) -> &GeminiDiscovery {
+        &self.discovery
+    }
+
+    pub fn hook_name(&self) -> &'static str {
+        self.hook.name()
+    }
+
+    /// Defaults to `auto` (prioritizes Gemini Decision 1 when configured, falling back to local
+    /// on provider failures). Explicit `RSGUI_DECISION_MODE=local|auto|gemini` overrides.
     pub fn from_env() -> Result<Self, Error> {
-        Self::from_configuration(|name| match std::env::var(name) {
-            Ok(value) => Ok(Some(value)),
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidConfiguration(
-                "environment values must be valid Unicode",
-            )),
-        })
+        let mut engine = Self::from_configuration(read_env_unicode)?;
+        if engine.mode != Mode::Local {
+            let probe_sidecar =
+                parse_probe_sidecar(read_env_unicode("RSGUI_DECISION_PROBE_SIDECAR")?.as_deref())?;
+            engine.discovery = GeminiDiscovery {
+                api_key_configured: engine.provider.is_some(),
+                gemini_core_cli: find_gemini_core_installation(),
+                sidecar_healthy: probe_sidecar
+                    && probe_sidecar_health(
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), SIDECAR_PORT),
+                        SIDECAR_PROBE_TIMEOUT,
+                    ),
+                available: false,
+            }
+            .finalize();
+        }
+        Ok(engine)
     }
 
     fn from_configuration(
@@ -245,7 +369,7 @@ impl Engine {
             .as_deref()
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
-            .unwrap_or("local")
+            .unwrap_or("auto")
         {
             "local" => Mode::Local,
             "auto" => Mode::Auto,
@@ -301,6 +425,8 @@ impl Engine {
                 Ok(Self {
                     mode,
                     provider: None,
+                    discovery: GeminiDiscovery::default(),
+                    hook: Box::new(PreferGeminiDecisionHook::default()),
                 })
             } else {
                 Err(Error::MissingApiKey)
@@ -349,11 +475,47 @@ impl Engine {
                 cooldown: None,
                 endpoint: endpoint.to_owned(),
             }),
+            discovery: GeminiDiscovery {
+                api_key_configured: true,
+                gemini_core_cli: false,
+                sidecar_healthy: false,
+                available: true,
+            },
+            hook: Box::new(PreferGeminiDecisionHook::default()),
         })
     }
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    fn hook_context<'a>(&'a self, input: &'a DecisionInput) -> DecisionHookContext<'a> {
+        DecisionHookContext {
+            mode: self.mode,
+            discovery: &self.discovery,
+            input,
+            provider_configured: self.provider.is_some(),
+        }
+    }
+
+    /// Returns whether evaluation will attempt a remote provider request and needs the PNG payload.
+    pub fn needs_image(&self, input: &DecisionInput) -> bool {
+        let Some(provider) = self.provider.as_ref() else {
+            return false;
+        };
+        if self.mode == Mode::Local
+            || provider
+                .cooldown
+                .is_some_and(|(until, _)| until > Instant::now())
+            || matches!(input.facts, Facts::Wait | Facts::Done | Facts::Blocked)
+        {
+            return false;
+        }
+        match self.hook.before_evaluate(&self.hook_context(input)) {
+            HookDirective::UseLocal => false,
+            HookDirective::PreferGemini => true,
+            HookDirective::Continue => input.facts == Facts::Unknown,
+        }
     }
 
     pub fn evaluate(
@@ -372,8 +534,13 @@ impl Engine {
             Facts::Blocked => (ActionDecision::Stop, None),
             Facts::Unknown => (ActionDecision::Observe, None),
         };
-        if input.facts != Facts::Unknown || self.mode == Mode::Local {
-            return Ok(Decision {
+        let directive = self.hook.before_evaluate(&self.hook_context(input));
+        let force_local = matches!(input.facts, Facts::Wait | Facts::Done | Facts::Blocked)
+            || self.mode == Mode::Local
+            || matches!(directive, HookDirective::UseLocal)
+            || (input.facts != Facts::Unknown && !matches!(directive, HookDirective::PreferGemini));
+        if force_local {
+            let decision = Decision {
                 action,
                 candidate_id,
                 confidence: None,
@@ -384,7 +551,10 @@ impl Engine {
                 estimated_cost_usd: None,
                 error: None,
                 error_code: None,
-            });
+            };
+            self.hook
+                .after_evaluate(&self.hook_context(input), &decision);
+            return Ok(decision);
         }
 
         if let Some(provider) = self.provider.as_ref() {
@@ -392,8 +562,8 @@ impl Engine {
         }
 
         let mut decision = Decision {
-            action,
-            candidate_id,
+            action: ActionDecision::Observe,
+            candidate_id: None,
             confidence: None,
             source: String::new(),
             calls: 0,
@@ -423,6 +593,8 @@ impl Engine {
         match result {
             Ok(()) => {
                 decision.source = "gemini".to_owned();
+                self.hook
+                    .after_evaluate(&self.hook_context(input), &decision);
                 Ok(decision)
             }
             Err(error @ (Error::InvalidInput(_) | Error::Cancelled)) => Err(error),
@@ -433,11 +605,96 @@ impl Engine {
                 decision.source = "auto_fallback".to_owned();
                 decision.error_code = Some(error.code().to_owned());
                 decision.error = Some(error.to_string());
+                self.hook
+                    .after_evaluate(&self.hook_context(input), &decision);
                 Ok(decision)
             }
             Err(error) => Err(error),
         }
     }
+}
+
+fn read_env_unicode(name: &str) -> Result<Option<String>, Error> {
+    match std::env::var(name) {
+        Ok(value) => Ok(Some(value)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => Err(Error::InvalidConfiguration(
+            "environment values must be valid Unicode",
+        )),
+    }
+}
+
+fn parse_probe_sidecar(raw: Option<&str>) -> Result<bool, Error> {
+    match raw
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        None | Some("1" | "true" | "on" | "yes") => Ok(true),
+        Some("0" | "false" | "off" | "no") => Ok(false),
+        Some(_) => Err(Error::InvalidConfiguration(
+            "RSGUI_DECISION_PROBE_SIDECAR must be a boolean",
+        )),
+    }
+}
+
+fn find_gemini_core_installation() -> bool {
+    let path_var = std::env::var_os("PATH");
+    let core_home = std::env::var_os("GEMINI_CORE_HOME");
+    let user_home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"));
+    find_gemini_core_cli_with(
+        path_var.as_deref(),
+        core_home.as_deref().map(Path::new),
+        user_home.as_deref().map(Path::new),
+    )
+}
+
+fn find_gemini_core_cli_with(
+    path_var: Option<&OsStr>,
+    core_home: Option<&Path>,
+    user_home: Option<&Path>,
+) -> bool {
+    if core_home.is_some_and(|dir| !dir.as_os_str().is_empty() && dir.is_dir()) {
+        return true;
+    }
+    if user_home.is_some_and(|home| {
+        !home.as_os_str().is_empty() && home.join(".gemini-decision-1").is_dir()
+    }) {
+        return true;
+    }
+    let Some(path_var) = path_var else {
+        return false;
+    };
+    let names: &[&str] = if cfg!(windows) {
+        &[
+            "gemini-core.exe",
+            "gemini-core.cmd",
+            "gemini-core.bat",
+            "gemini-core",
+        ]
+    } else {
+        &["gemini-core"]
+    };
+    std::env::split_paths(path_var)
+        .any(|dir| !dir.as_os_str().is_empty() && names.iter().any(|name| dir.join(name).is_file()))
+}
+
+fn probe_sidecar_health(addr: SocketAddr, timeout: Duration) -> bool {
+    let Ok(mut stream) = TcpStream::connect_timeout(&addr, timeout) else {
+        return false;
+    };
+    let _ = stream.set_read_timeout(Some(timeout));
+    let _ = stream.set_write_timeout(Some(timeout));
+    if stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        .is_err()
+    {
+        return false;
+    }
+    let mut head = [0u8; 256];
+    let Ok(read) = stream.read(&mut head) else {
+        return false;
+    };
+    head[..read].starts_with(b"HTTP/1.1 200") || head[..read].starts_with(b"HTTP/1.0 200")
 }
 
 fn send_remote(

@@ -16,10 +16,8 @@ cargo build --release --workspace --all-features --locked
 .\target\release\rsgui-decision.exe mcp
 ```
 
-EXE 與 `autogui_runtime.dll` 必須放在同目錄。預設 `RSGUI_DECISION_MODE=local`，
-不發送網路請求。單一候選代表呼叫者已選定的動作；多候選時 local 回傳 observe，
-不猜測畫面。明確設定 `auto` 或 `gemini` 及 `GEMINI_API_KEY` 才啟用 Google API；
-此時會傳送所選視窗影像。原六種 coding-agent 決策域並未全部移植。
+EXE 與 `autogui_runtime.dll` 必須放在同目錄。預設 `RSGUI_DECISION_MODE=auto`，
+只要存在 `GEMINI_API_KEY`（或 `GOOGLE_API_KEY`），即透過內建 `PreferGeminiDecisionHook` 優先於多候選決策呼叫 Google Gemini Decision 1（失敗時安全退回本機 `observe`），同時並偵測選配本機 `gemini-core`／`127.0.0.1:8792` 與提供 Antigravity `.agents/hooks.json` 工作區 Hook。單一候選維持本機確定性動作，設定 `RSGUI_DECISION_MODE=local` 可完全停用網路與金鑰讀取。原六種 coding-agent 決策域並未全部移植。
 
 使用方式、成本／影像說明、驗收與升級還原見
 [整合指南](docs/decision-integration.md)；來源、版本與授權見

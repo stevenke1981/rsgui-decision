@@ -26,7 +26,7 @@
   },
   {
     "name": "decision_evaluate",
-    "description": "Bind a bounded choice to the current capture and immutable caller-supplied actions. One candidate is a deterministic caller action; multiple candidates in local mode return observe. Explicit remote mode sends selected window pixels to Google Gemini Decision 1. No input is sent. Returns a single-use decision_id only for a sufficiently confident choice. Rechecks pixels before and after evaluation.",
+    "description": "Bind a bounded choice to the current capture and immutable caller-supplied actions. One candidate is a deterministic caller action; multiple candidates in local mode return observe. Default auto (with fallback) or explicit gemini mode sends selected window pixels to Google Gemini Decision 1 when an API key is configured. No input is sent. Returns a single-use decision_id only for a sufficiently confident choice. Rechecks pixels before and after evaluation.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -238,7 +238,7 @@
   },
   {
     "name": "decision_step",
-    "description": "Evaluate one observation and, only when a candidate is chosen, perform one action plus local adaptive wait and fresh capture in a single host call. Same checks and limits as evaluate/act. Local mode deterministically executes a sole caller-selected candidate; never guesses among multiple actions.",
+    "description": "Evaluate one observation and, only when a candidate is chosen, perform one action plus local adaptive wait and fresh capture in a single host call. Same checks and limits as evaluate/act. Single-candidate Ready executes deterministically; default auto prioritizes Gemini Decision 1 across multiple candidates when configured and falls back to observe on provider failure.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -437,7 +437,7 @@
   },
   {
     "name": "decision_status",
-    "description": "Read the configured provider mode and in-process decision/action counters without a network request or desktop input. Defaults to local; no credentials returned.",
+    "description": "Read the configured provider mode, Gemini Decision 1 hook/discovery availability, and in-process decision/action counters without desktop input or remote Gemini API requests. Defaults to auto; no credentials returned.",
     "inputSchema": {
       "type": "object",
       "properties": {},

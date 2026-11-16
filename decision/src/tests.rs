@@ -124,13 +124,14 @@ fn remote(mode: Mode, body: serde_json::Value) -> Result<Decision, Error> {
 }
 
 #[test]
-fn local_default_never_reads_a_key_or_calls_network() {
+fn explicit_local_mode_never_reads_a_key_or_calls_network() {
     let mut engine = Engine::from_configuration(|name| {
         assert!(!name.ends_with("API_KEY"));
-        Ok(None)
+        Ok((name == "RSGUI_DECISION_MODE").then(|| "local".to_owned()))
     })
     .unwrap();
     assert_eq!(engine.mode(), Mode::Local);
+    assert!(!engine.has_provider());
     let decision = engine.evaluate(&input(), None, &|| Ok(())).unwrap();
     assert_eq!(decision.action, ActionDecision::Observe);
     assert_eq!(decision.calls, 0);
@@ -139,6 +140,31 @@ fn local_default_never_reads_a_key_or_calls_network() {
     assert_eq!(decision.estimated_cost_usd, None);
     assert_eq!(decision.error_code, None);
     assert_eq!(decision.candidate_id, None);
+}
+
+#[test]
+fn auto_default_prioritizes_key_when_present_and_falls_back_when_absent() {
+    let mut no_key = Engine::from_configuration(|_| Ok(None)).unwrap();
+    assert_eq!(no_key.mode(), Mode::Auto);
+    assert!(!no_key.has_provider());
+    assert!(!no_key.needs_image(&input()));
+    let decision = no_key.evaluate(&input(), None, &|| Ok(())).unwrap();
+    assert_eq!(decision.action, ActionDecision::Observe);
+    assert_eq!(decision.calls, 0);
+    assert_eq!(decision.source, "auto_fallback");
+    assert_eq!(
+        decision.error_code.as_deref(),
+        Some("GEMINI_MISSING_API_KEY")
+    );
+
+    let with_key =
+        Engine::from_configuration(|name| Ok((name == "GEMINI_API_KEY").then(|| KEY.to_owned())))
+            .unwrap();
+    assert_eq!(with_key.mode(), Mode::Auto);
+    assert!(with_key.has_provider());
+    assert!(with_key.discovery().api_key_configured);
+    assert!(with_key.discovery().available);
+    assert!(with_key.needs_image(&input()));
 }
 
 #[test]
@@ -158,10 +184,7 @@ fn local_truth_is_deterministic_in_every_mode() {
             let mut input = input();
             input.candidates.truncate(1);
             input.facts = facts;
-            let mut engine = Engine {
-                mode,
-                provider: None,
-            };
+            let mut engine = Engine::without_provider(mode);
             let decision = engine.evaluate(&input, None, &|| Ok(())).unwrap();
             assert_eq!(decision.action, action);
             assert_eq!(decision.calls, 0);
@@ -768,10 +791,7 @@ fn unavailable_transport_and_absent_keys_have_safe_auto_fallback() {
         }
         handle.join().unwrap();
     }
-    let mut engine = Engine {
-        mode: Mode::Auto,
-        provider: None,
-    };
+    let mut engine = Engine::without_provider(Mode::Auto);
     let decision = engine.evaluate(&input(), None, &|| Ok(())).unwrap();
     assert_eq!(decision.action, ActionDecision::Observe);
     assert_eq!(decision.calls, 0);
@@ -1029,4 +1049,207 @@ fn retry_after_handles_seconds_dates_and_bad_values() {
     let past = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(60));
     assert_eq!(retry_after_duration(&past), Some(Duration::from_secs(1)));
     assert_eq!(retry_after_duration("not a date"), None);
+}
+
+#[test]
+fn decision_hooks_control_gemini_priority_and_observe_results() {
+    struct TestHook {
+        directive: HookDirective,
+        observed_sources: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+    impl DecisionHook for TestHook {
+        fn name(&self) -> &'static str {
+            "test_hook"
+        }
+        fn before_evaluate(&self, _ctx: &DecisionHookContext<'_>) -> HookDirective {
+            self.directive
+        }
+        fn after_evaluate(&self, _ctx: &DecisionHookContext<'_>, decision: &Decision) {
+            self.observed_sources
+                .lock()
+                .unwrap()
+                .push(decision.source.clone());
+        }
+    }
+
+    let sources = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (mut engine, receive, handle) = mock(
+        Mode::Auto,
+        200,
+        answer("save", 0.92).to_string(),
+        "",
+        Duration::ZERO,
+    );
+    let mut ready_input = input();
+    ready_input.candidates.truncate(1);
+    ready_input.facts = Facts::Ready {
+        candidate_id: "save".to_owned(),
+    };
+
+    // Default PreferGeminiDecisionHook keeps single-candidate Ready local and saves network calls.
+    assert!(!engine.needs_image(&ready_input));
+    let local_ready = engine.evaluate(&ready_input, None, &|| Ok(())).unwrap();
+    assert_eq!(local_ready.calls, 0);
+    assert_eq!(local_ready.source, "local");
+
+    // Opting into evaluate_ready via hook promotes single-candidate Ready to Gemini Decision 1.
+    engine.set_hook(PreferGeminiDecisionHook {
+        evaluate_ready: true,
+    });
+    assert!(engine.needs_image(&ready_input));
+    let remote_ready = engine.evaluate(&ready_input, None, &|| Ok(())).unwrap();
+    assert_eq!(remote_ready.calls, 1);
+    assert_eq!(remote_ready.source, "gemini");
+    assert_eq!(remote_ready.candidate_id.as_deref(), Some("save"));
+    receive.recv_timeout(Duration::from_secs(3)).unwrap();
+    handle.join().unwrap();
+
+    // When remote overrides Ready with a non-Choose decision, candidate_id must be cleared to None.
+    for (remote_choice, expected_action) in [
+        ("observe", ActionDecision::Observe),
+        ("stop", ActionDecision::Stop),
+    ] {
+        struct ReadyRemoteObserver(std::sync::Arc<std::sync::Mutex<Option<Option<String>>>>);
+        impl DecisionHook for ReadyRemoteObserver {
+            fn name(&self) -> &'static str {
+                "ready_remote_observer"
+            }
+            fn before_evaluate(&self, _ctx: &DecisionHookContext<'_>) -> HookDirective {
+                HookDirective::PreferGemini
+            }
+            fn after_evaluate(&self, _ctx: &DecisionHookContext<'_>, decision: &Decision) {
+                *self.0.lock().unwrap() = Some(decision.candidate_id.clone());
+            }
+        }
+        let observed_id = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (mut engine, receive, handle) = mock(
+            Mode::Auto,
+            200,
+            answer(remote_choice, 0.93).to_string(),
+            "",
+            Duration::ZERO,
+        );
+        engine.set_hook(ReadyRemoteObserver(observed_id.clone()));
+        let overridden = engine.evaluate(&ready_input, None, &|| Ok(())).unwrap();
+        assert_eq!(overridden.action, expected_action);
+        assert_eq!(overridden.source, "gemini");
+        assert_eq!(overridden.candidate_id, None);
+        assert_eq!(*observed_id.lock().unwrap(), Some(None));
+        receive.recv_timeout(Duration::from_secs(3)).unwrap();
+        handle.join().unwrap();
+    }
+
+    // Active cooldown skips redundant PNG encoding in needs_image().
+    let (mut cooldown_engine, receive, handle) =
+        mock(Mode::Auto, 401, "{}".into(), "", Duration::ZERO);
+    assert!(cooldown_engine.needs_image(&input()));
+    let _ = cooldown_engine
+        .evaluate(&input(), None, &|| Ok(()))
+        .unwrap();
+    assert!(!cooldown_engine.needs_image(&input()));
+    receive.recv_timeout(Duration::from_secs(3)).unwrap();
+    handle.join().unwrap();
+
+    // HookDirective::UseLocal forces offline local resolution even on Facts::Unknown in Auto mode.
+    let mut engine = Engine::configured(
+        Mode::Auto,
+        KEY.to_owned(),
+        Duration::from_millis(100),
+        "http://127.0.0.1:9/unused",
+    )
+    .unwrap()
+    .with_hook(TestHook {
+        directive: HookDirective::UseLocal,
+        observed_sources: sources.clone(),
+    });
+    assert_eq!(engine.hook_name(), "test_hook");
+    assert!(!engine.needs_image(&input()));
+    let forced_local = engine.evaluate(&input(), None, &|| Ok(())).unwrap();
+    assert_eq!(forced_local.calls, 0);
+    assert_eq!(forced_local.source, "local");
+    assert_eq!(sources.lock().unwrap().as_slice(), ["local"]);
+
+    // Local mode remains offline even if a hook returns PreferGemini.
+    let mut local_engine = Engine::local().with_hook(TestHook {
+        directive: HookDirective::PreferGemini,
+        observed_sources: sources.clone(),
+    });
+    assert!(!local_engine.needs_image(&input()));
+    let stays_local = local_engine.evaluate(&input(), None, &|| Ok(())).unwrap();
+    assert_eq!(stays_local.calls, 0);
+    assert_eq!(stays_local.source, "local");
+}
+
+#[test]
+fn discovery_detects_sidecar_cli_and_probe_flag() {
+    assert!(parse_probe_sidecar(None).unwrap());
+    assert!(parse_probe_sidecar(Some(" true ")).unwrap());
+    assert!(!parse_probe_sidecar(Some("0")).unwrap());
+    assert!(!parse_probe_sidecar(Some("FALSE")).unwrap());
+    assert!(parse_probe_sidecar(Some("maybe")).is_err());
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("rsgui-discovery-{unique}"));
+    let bin_dir = root.join("bin");
+    let home_dir = root.join("home");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    std::fs::create_dir_all(&home_dir).unwrap();
+
+    assert!(!find_gemini_core_cli_with(
+        Some(bin_dir.as_os_str()),
+        None,
+        Some(&home_dir),
+    ));
+
+    let cli_name = if cfg!(windows) {
+        "gemini-core.cmd"
+    } else {
+        "gemini-core"
+    };
+    std::fs::write(bin_dir.join(cli_name), b"@echo off\r\n").unwrap();
+    assert!(find_gemini_core_cli_with(
+        Some(bin_dir.as_os_str()),
+        None,
+        Some(&home_dir),
+    ));
+
+    std::fs::remove_file(bin_dir.join(cli_name)).unwrap();
+    std::fs::create_dir_all(home_dir.join(".gemini-decision-1")).unwrap();
+    assert!(find_gemini_core_cli_with(
+        Some(bin_dir.as_os_str()),
+        None,
+        Some(&home_dir),
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+
+    let ok_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let ok_addr = ok_listener.local_addr().unwrap();
+    let ok_thread = thread::spawn(move || {
+        let (mut socket, _) = ok_listener.accept().unwrap();
+        let mut buf = [0u8; 256];
+        let _ = socket.read(&mut buf);
+        let body = "{\"ok\":true}";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = socket.write_all(response.as_bytes());
+    });
+    assert!(probe_sidecar_health(ok_addr, Duration::from_millis(250)));
+    ok_thread.join().unwrap();
+
+    let err_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let err_addr = err_listener.local_addr().unwrap();
+    let err_thread = thread::spawn(move || {
+        let (mut socket, _) = err_listener.accept().unwrap();
+        let mut buf = [0u8; 256];
+        let _ = socket.read(&mut buf);
+        let _ = socket.write_all(b"HTTP/1.1 503 Unavailable\r\nContent-Length: 0\r\n\r\n");
+    });
+    assert!(!probe_sidecar_health(err_addr, Duration::from_millis(250)));
+    err_thread.join().unwrap();
 }

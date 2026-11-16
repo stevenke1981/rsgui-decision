@@ -53,25 +53,38 @@ not saved/sent/completed. `timeout` still returns the latest image. If an error
 occurs after input, the result states `input_sent=true` or `unknown_or_partial`;
 never repeat it without inspecting the target. No automatic action retry exists.
 
-## Provider and cost
+## Provider, discovery hook, and cost
 
-Default `RSGUI_DECISION_MODE=local` makes no provider calls. Deterministic facts
-(`Ready` with a sole validated candidate, `Wait`, `Done`, or `Blocked`) resolve
-with zero provider calls in `local`, `auto`, and `gemini` modes — a sole
-validated candidate is the caller's deterministic action, not a claim of machine
-visual understanding. Unknown facts with multiple candidates return `observe` in
-`local` mode.
+Default `RSGUI_DECISION_MODE=auto` (trimmed, case-insensitive; override with
+`local`, `auto`, or `gemini`) prioritizes Google Gemini Decision 1 via the built-in
+`PreferGeminiDecisionHook` whenever an API key is configured, and falls back
+safely to local `observe` (`source: "auto_fallback"`) on provider failures or
+absent keys. Deterministic facts (`Ready` with a sole validated candidate, `Wait`,
+`Done`, or `Blocked`) resolve with zero provider calls across `local`, `auto`,
+and `gemini` modes unless a custom Rust `DecisionHook` explicitly sets
+`evaluate_ready: true` — a sole validated candidate is the caller's deterministic
+action, not a claim of machine visual understanding. Unknown facts with multiple
+candidates return `observe` in `local` mode (`RSGUI_DECISION_MODE=local` never
+reads API keys or makes network calls).
 
-Explicit `RSGUI_DECISION_MODE=auto` or `gemini` (trimmed, case-insensitive) opts
-into Google's fixed `https://generativelanguage.googleapis.com/v1beta/decisions`
-endpoint for unknown facts, sending the selected window PNG
-(`1..=16,777,216` base64 bytes, up to 12 MiB decoded PNG), redacted `goal`, and
-redacted candidate descriptions. Credentials come only from the invoking process environment
-(`GEMINI_API_KEY` preferred over `GOOGLE_API_KEY`, trimmed; `.env` files are not
-loaded); keys never belong in a plan or Git. Before remote requests, common
-secret patterns and any literal key value are redacted from `goal` and
-`candidate.description`, whereas immutable `candidate.id` values or PNG
-payloads matching the configured key are rejected as `InvalidInput` (without
+In `auto` and `gemini` modes, `Engine::from_env()` also populates non-secret
+`gemini_decision_1` discovery metadata (`api_key_configured`, local `gemini-core`
+CLI / `~/.gemini-decision-1` presence, and loopback `127.0.0.1:8792/health`
+sidecar probe unless disabled via `RSGUI_DECISION_PROBE_SIDECAR=0`). Alongside the
+Rust `DecisionHook` API, `.agents/hooks.json` +
+`.agents/hooks/prefer-gemini-decision.ps1` provides Antigravity `SessionStart`
+and `PreToolUse` workspace hooks so agents prioritize `decision_observe`,
+`decision_evaluate`, and `decision_step` whenever Gemini Decision 1 is available.
+
+Google's fixed `https://generativelanguage.googleapis.com/v1beta/decisions`
+endpoint is contacted in `auto` or `gemini` modes for remote decisions, sending
+the selected window PNG (`1..=16,777,216` base64 bytes, up to 12 MiB decoded PNG),
+redacted `goal`, and redacted candidate descriptions. Credentials come only from
+the invoking process environment (`GEMINI_API_KEY` preferred over `GOOGLE_API_KEY`,
+trimmed; `.env` files are not loaded); keys never belong in a plan or Git. Before
+remote requests, common secret patterns and any literal key value are redacted
+from `goal` and `candidate.description`, whereas immutable `candidate.id` values or
+PNG payloads matching the configured key are rejected as `InvalidInput` (without
 fallback, including in `auto` mode). Unrelated windows are not intentionally
 captured, but overlapping windows and sensitive content visible in the selected
 region can appear in screenshots. Review the visible target before opting in.

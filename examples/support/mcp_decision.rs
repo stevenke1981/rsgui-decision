@@ -222,16 +222,24 @@ impl Session {
         match name {
             "decision_status" => {
                 let _: super::Empty = decode(args)?;
-                let mode = match self.decisions.engine.as_ref() {
-                    Some(engine) => engine.mode(),
-                    None => Engine::from_env().map_err(map_decision_error)?.mode(),
+                let probe;
+                let engine = if let Some(engine) = self.decisions.engine.as_ref() {
+                    engine
+                } else {
+                    probe = Engine::from_env().map_err(map_decision_error)?;
+                    &probe
                 };
+                let mode = engine.mode();
                 let provider_model = (mode != Mode::Local).then_some("gemini-decision-1");
                 Ok(text(json!({"mode":mode,
                     "evaluations":self.decisions.evaluations,"action_attempts":self.decisions.action_attempts,
                     "pending_decision":self.decisions.pending.as_ref().map(|pending| &pending.id),
-                    "provider_model":provider_model,"automatic_retries":false,
-                    "scope":"bounded GUI decisions; local single-candidate mode is deterministic, not visual understanding"})))
+                    "provider_model":provider_model,
+                    "provider_ready":engine.has_provider(),
+                    "hook":engine.hook_name(),
+                    "gemini_decision_1":engine.discovery(),
+                    "automatic_retries":false,
+                    "scope":"bounded GUI decisions; auto prioritizes Gemini Decision 1 when available and falls back safely; local single-candidate mode is deterministic"})))
             }
             "decision_observe" => self.call("observe", args, check),
             "decision_evaluate" => {
@@ -351,12 +359,6 @@ impl Session {
             ));
         }
         self.decision_engine()?;
-        let mode = self
-            .decisions
-            .engine
-            .as_ref()
-            .ok_or(Error::InvalidArgument("decision engine unavailable"))?
-            .mode();
         let proof = self.capture.take().ok_or(Error::InvalidArgument(
             "capture/observe the selected window first",
         ))?;
@@ -378,13 +380,18 @@ impl Session {
         } else {
             Facts::Unknown
         };
-        let needs_image = mode != Mode::Local && facts == Facts::Unknown;
         let input = DecisionInput {
             goal: request.goal,
             candidates,
             facts,
             minimum_confidence: request.minimum_confidence,
         };
+        let needs_image = self
+            .decisions
+            .engine
+            .as_ref()
+            .ok_or(Error::InvalidArgument("decision engine unavailable"))?
+            .needs_image(&input);
         let image = if needs_image {
             match encode_png_base64(&proof.frame) {
                 Ok(data) => Some(data),
@@ -804,8 +811,23 @@ mod tests {
         assert!(session.decisions.engine.is_none());
         let status_json: Value =
             serde_json::from_str(status["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(status_json["mode"], "local");
-        assert!(status_json["provider_model"].is_null());
+        let expected_mode = match std::env::var("RSGUI_DECISION_MODE")
+            .ok()
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("local") => "local",
+            Some("gemini") => "gemini",
+            _ => "auto",
+        };
+        assert_eq!(status_json["mode"], expected_mode);
+        if expected_mode == "local" {
+            assert!(status_json["provider_model"].is_null());
+        } else {
+            assert_eq!(status_json["provider_model"], "gemini-decision-1");
+        }
+        assert_eq!(status_json["hook"], "prefer_gemini_decision_1");
+        assert!(status_json["gemini_decision_1"]["available"].is_boolean());
 
         let pending = Pending {
             id: "d1".into(),
