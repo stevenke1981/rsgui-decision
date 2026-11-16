@@ -3,7 +3,7 @@
 param([Parameter(Mandatory=$true)][string[]]$Executable,[switch]$LiveScreensaver)
 $ErrorActionPreference='Stop'
 function Assert($Condition,[string]$Message) {if(-not $Condition){throw $Message}}
-function StartMcp([string]$Path) {
+function StartMcp([string]$Path,[string]$DecisionMode='local') {
     $start=New-Object Diagnostics.ProcessStartInfo
     $start.FileName=$Path
     $start.Arguments='mcp'
@@ -14,7 +14,11 @@ function StartMcp([string]$Path) {
     $start.RedirectStandardError=$true
     $start.StandardOutputEncoding=[Text.Encoding]::UTF8
     $start.StandardErrorEncoding=[Text.Encoding]::UTF8
-    $start.EnvironmentVariables['RSGUI_DECISION_MODE']='local'
+    if ([string]::IsNullOrEmpty($DecisionMode)) {
+        if ($start.EnvironmentVariables.ContainsKey('RSGUI_DECISION_MODE')) { [void]$start.EnvironmentVariables.Remove('RSGUI_DECISION_MODE') }
+    } else {
+        $start.EnvironmentVariables['RSGUI_DECISION_MODE']=$DecisionMode
+    }
     $process=New-Object Diagnostics.Process
     $process.StartInfo=$start
     $inputEncoding=[Console]::InputEncoding
@@ -95,7 +99,7 @@ foreach ($targetExe in $Executable) {
         $decisionStatus=Tool $client decision_status @{}
         Assert (-not $decisionStatus.isError) "decision_status failed: $($decisionStatus.content[0].text)"
         $ds=$decisionStatus.content[0].text | ConvertFrom-Json
-        Assert ($ds.mode -eq 'local' -and $ds.evaluations -eq 0 -and $ds.action_attempts -eq 0 -and $null -eq $ds.pending_decision -and $null -eq $ds.provider_model -and $ds.automatic_retries -eq $false) 'Unexpected decision_status payload'
+        Assert ($ds.mode -eq 'local' -and $ds.evaluations -eq 0 -and $ds.action_attempts -eq 0 -and $null -eq $ds.pending_decision -and $null -eq $ds.provider_model -and $ds.provider_ready -eq $false -and $ds.hook -eq 'prefer_gemini_decision_1' -and $ds.automatic_retries -eq $false) 'Unexpected decision_status payload'
         $badStatus=Tool $client decision_status @{extra=$true}
         Assert $badStatus.isError 'decision_status accepted unknown field'
         $obsMissing=Tool $client decision_observe @{target='never-existed'}
@@ -129,6 +133,17 @@ foreach ($targetExe in $Executable) {
             Assert ($afterText -ceq $initial.status_text) 'MCP EOF did not restore exact screensaver status'
         }
     } finally {StopMcp $client}
+
+    # Verify default mode is auto when RSGUI_DECISION_MODE is unset and PreferGeminiDecisionHook is active.
+    $defaultClient=$null
+    try {
+        $defaultClient=StartMcp $exePath ''
+        Initialize $defaultClient
+        $defaultStatus=Tool $defaultClient decision_status @{}
+        Assert (-not $defaultStatus.isError) "Default auto decision_status failed: $($defaultStatus.content[0].text)"
+        $dsAuto=$defaultStatus.content[0].text | ConvertFrom-Json
+        Assert ($dsAuto.mode -eq 'auto' -and $dsAuto.provider_model -eq 'gemini-decision-1' -and $dsAuto.hook -eq 'prefer_gemini_decision_1' -and ($null -ne $dsAuto.gemini_decision_1)) "Unexpected default decision_status payload: $($defaultStatus.content[0].text)"
+    } finally {StopMcp $defaultClient}
 
     # A separated EXE remains able to describe tools and reports missing DLL clearly.
     $agentRootExisted=Test-Path -LiteralPath $agentRoot

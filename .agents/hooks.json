@@ -1,0 +1,23 @@
+{
+  "prefer-gemini-decision-1": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./hooks/prefer-gemini-decision.ps1",
+        "timeout": 5
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "call_mcp_tool|mcp_autogui_.*|click_at|click_image|locate|scroll|type_text|hotkey",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ./hooks/prefer-gemini-decision.ps1",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
