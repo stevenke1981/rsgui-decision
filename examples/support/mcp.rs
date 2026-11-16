@@ -28,6 +28,7 @@ pub(crate) const NAMES: &[&str] = &[
     "decision_evaluate",
     "decision_act",
     "decision_step",
+    "decision_select",
     "decision_status",
 ];
 pub(crate) fn definitions() -> Value {

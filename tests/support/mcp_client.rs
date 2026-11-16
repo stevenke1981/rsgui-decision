@@ -47,7 +47,7 @@ impl Client {
                 .as_array()
                 .unwrap()
                 .len(),
-            19
+            20
         );
         client
     }

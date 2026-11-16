@@ -19,6 +19,9 @@ function StartMcp([string]$Path,[string]$DecisionMode='local') {
     } else {
         $start.EnvironmentVariables['RSGUI_DECISION_MODE']=$DecisionMode
     }
+    foreach ($varName in @('RSGUI_DECISION_IMAGE_RESOLUTION','RSGUI_DECISION_MAX_IMAGE_DIM')) {
+        if ($start.EnvironmentVariables.ContainsKey($varName)) { [void]$start.EnvironmentVariables.Remove($varName) }
+    }
     $process=New-Object Diagnostics.Process
     $process.StartInfo=$start
     $inputEncoding=[Console]::InputEncoding
@@ -76,8 +79,8 @@ foreach ($targetExe in $Executable) {
         Initialize $client
         $list=Request $client 'tools/list' @{}
         $toolNames=@($list.result.tools.name)
-        Assert ($list.result.tools.Count -eq 19 -and @($toolNames | Sort-Object -Unique).Count -eq 19) "Wrong tool count for $exePath"
-        foreach ($expectedDecision in @('decision_observe','decision_evaluate','decision_act','decision_step','decision_status')) {
+        Assert ($list.result.tools.Count -eq 20 -and @($toolNames | Sort-Object -Unique).Count -eq 20) "Wrong tool count for $exePath"
+        foreach ($expectedDecision in @('decision_observe','decision_evaluate','decision_act','decision_step','decision_select','decision_status')) {
             Assert ($toolNames -contains $expectedDecision) "Missing tool $expectedDecision in $exePath"
         }
         Assert (-not (Loaded $client)) 'DLL loaded just to initialize/list tools'
@@ -115,6 +118,10 @@ foreach ($targetExe in $Executable) {
         Assert $stepBadField.isError 'decision_step accepted unknown field'
         $stepNoCapture=Tool $client decision_step @{request=@{target='never-existed';capture_id='never-existed';goal='test';candidates=@($candidate)}}
         Assert ($stepNoCapture.isError -and $stepNoCapture.content[0].text -match 'capture|observe') "decision_step error unclear: $($stepNoCapture.content[0].text)"
+        $selectBadField=Tool $client decision_select @{target='never-existed';goal='test';candidates=@($candidate);extra=$true}
+        Assert $selectBadField.isError 'decision_select accepted unknown field'
+        $selectMissingTarget=Tool $client decision_select @{target='never-existed';goal='test';candidates=@($candidate)}
+        Assert ($selectMissingTarget.isError -and $selectMissingTarget.content[0].text -match 'target') "decision_select error unclear: $($selectMissingTarget.content[0].text)"
         $status=Tool $client screensaver @{action='status'}
         Assert (-not $status.isError) 'Screensaver status failed through DLL'
         if($LiveScreensaver) {
@@ -142,7 +149,8 @@ foreach ($targetExe in $Executable) {
         $defaultStatus=Tool $defaultClient decision_status @{}
         Assert (-not $defaultStatus.isError) "Default auto decision_status failed: $($defaultStatus.content[0].text)"
         $dsAuto=$defaultStatus.content[0].text | ConvertFrom-Json
-        Assert ($dsAuto.mode -eq 'auto' -and $dsAuto.provider_model -eq 'gemini-decision-1' -and $dsAuto.hook -eq 'prefer_gemini_decision_1' -and ($null -ne $dsAuto.gemini_decision_1)) "Unexpected default decision_status payload: $($defaultStatus.content[0].text)"
+        $expectedAutoResolution=if($dsAuto.provider_ready){'medium'}else{$null}
+        Assert ($dsAuto.mode -eq 'auto' -and $dsAuto.provider_model -eq 'gemini-decision-1' -and $dsAuto.hook -eq 'prefer_gemini_decision_1' -and $dsAuto.image_resolution -eq $expectedAutoResolution -and $dsAuto.max_image_dim -eq 1280 -and ($null -ne $dsAuto.gemini_decision_1)) "Unexpected default decision_status payload: $($defaultStatus.content[0].text)"
     } finally {StopMcp $defaultClient}
 
     # A separated EXE remains able to describe tools and reports missing DLL clearly.
@@ -155,7 +163,7 @@ foreach ($targetExe in $Executable) {
         Copy-Item -LiteralPath $exePath -Destination $separated
         $client=StartMcp $separated
         Initialize $client
-        Assert ((Request $client 'tools/list' @{}).result.tools.Count -eq 19) 'Tool listing requires DLL'
+        Assert ((Request $client 'tools/list' @{}).result.tools.Count -eq 20) 'Tool listing requires DLL'
         foreach ($call in @(@{Name='screensaver';Args=@{action='status'}},@{Name='decision_status';Args=@{}})) {
             $missing=Tool $client $call.Name $call.Args
             Assert ($missing.isError -and $missing.content[0].text -match 'autogui_runtime\.dll') "Missing DLL failure unclear for $($call.Name)"

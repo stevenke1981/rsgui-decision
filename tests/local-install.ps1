@@ -250,7 +250,7 @@ try {
         $newClient=StartOwnMcp (Join-Path $runningInstall 'autogui-control.exe')
         $newVersion=InitializeOwnMcp $newClient
         Assert ($newVersion -eq $runningData.loader_version) 'New process version mismatch'
-        Assert (@((Request $newClient 'tools/list' @{}).result.tools).Count -eq 19) 'New process did not expose 19 tools'
+        Assert (@((Request $newClient 'tools/list' @{}).result.tools).Count -eq 20) 'New process did not expose 20 tools'
         Assert (-not (Request $newClient 'tools/call' @{name='session_status';arguments=@{}}).result.isError) 'New runtime call failed'
         Assert (-not (Request $newClient 'tools/call' @{name='decision_status';arguments=@{}}).result.isError) 'New decision_status call failed'
         MustFail { & $restore -Manifest $runningManifest } 'Exit processes using the newly installed file'
@@ -259,8 +259,8 @@ try {
         foreach ($path in $runningOriginals.Keys) { Assert ((Hash $path) -eq $runningOriginals[$path]) "Original running pair not restored: $path" }
         Assert (-not (Test-Path -LiteralPath (Join-Path $runningBin 'rsgui-decision.exe'))) 'Restore left the new bin alias'
         Assert (-not $oldClient.Process.HasExited -and -not (Request $oldClient 'tools/call' @{name='session_status';arguments=@{}}).result.isError) 'Old process did not survive restore'
-        WriteUtf8 (Join-Path $fixture 'in-use-result.json') (@{old_pid=$oldClient.Process.Id;old_version=$oldVersion;old_tools=$oldToolCount;new_version=$newVersion;new_tools=19;rename_rollback='PASS';old_process_preserved='PASS';restore_after_new_exit='PASS';previous_binaries_supplied=[bool]$PreviousBinariesDir} | ConvertTo-Json)
-        Write-Host "PASS in-use rename: old version=$oldVersion tools=$oldToolCount stayed alive; new version=$newVersion tools=19; failed-write rollback and restore after new EOF verified."
+        WriteUtf8 (Join-Path $fixture 'in-use-result.json') (@{old_pid=$oldClient.Process.Id;old_version=$oldVersion;old_tools=$oldToolCount;new_version=$newVersion;new_tools=20;rename_rollback='PASS';old_process_preserved='PASS';restore_after_new_exit='PASS';previous_binaries_supplied=[bool]$PreviousBinariesDir} | ConvertTo-Json)
+        Write-Host "PASS in-use rename: old version=$oldVersion tools=$oldToolCount stayed alive; new version=$newVersion tools=20; failed-write rollback and restore after new EOF verified."
     } finally { StopOwnMcp $newClient; StopOwnMcp $oldClient }
     Write-Host 'PASS local replacement: staged version/MCP, hashes, unique reinstall backups, original metadata, tamper refusal, verified restore/failed-write rollback, absent-file removal, lock/package rejection.'
 } finally { [Console]::InputEncoding = $originalInputEncoding; Write-Host "Local installer test evidence: $fixture" }

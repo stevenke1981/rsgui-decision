@@ -7,7 +7,7 @@ Rust 桌面操作與 Gemini Decision 1 的整合專案。沿用 rsautogui 的原
 將 GUI 所需決策契約重寫為 Rust，提供一個常駐 MCP 程序：
 **觀察 → 固定候選決策 → 一次操作 → 本機適應等待 → 新截圖**。
 
-`decision_step` 把一次操作、等待與新畫面合成一次宿主呼叫；MCP 總計提供 19 個工具：保留原有 14 個 rsautogui 工具，加上 5 個決策工具（`decision_observe`、`decision_evaluate`、`decision_act`、`decision_step`、`decision_status`），並保留 `autogui-control` CLI。新工具不接受模型生成的命令或座標，
+`decision_step` 與混合式 `decision_select`（支援本機模板快速路徑、多候選 Gemini Decision 1 慢速路徑及最多 4 個 `follow_up` 輸入）把觀察、選擇、操作、等待與新畫面合成單次宿主呼叫；MCP 總計提供 20 個工具：保留原有 14 個 rsautogui 工具，加上 6 個決策工具（`decision_observe`、`decision_evaluate`、`decision_act`、`decision_step`、`decision_select`、`decision_status`），並保留 `autogui-control` CLI。新工具不接受模型生成的命令或座標，
 只執行呼叫者已提供並由伺服器保存的候選。執行前核對視窗、完整畫面與單次憑證。工具 schema 見 `examples/support/mcp_tools.json` 與 `examples/support/decision_tools.json`（發行包內為 `docs/mcp-tools.json` 與 `docs/decision-tools.json`）。
 
 ```powershell
@@ -46,7 +46,7 @@ cargo build --release --workspace --all-features --locked
 .\scripts\package.ps1 -SkipBuild
 ```
 
-MCP 提供 19 個工具，涵蓋無人值守就緒檢查、顯示器／視窗列舉、指定顯示器截圖、移動 App、Win32 控制、找圖、點擊、捲動、文字、快捷鍵、螢幕保護程式，以及 5 個 bounded decision 工具（`decision_observe`、`decision_evaluate`、`decision_act`、`decision_step`、`decision_status`）。`capture`（喚起前景）與 `decision_observe`（不搶焦點之被動擷取）回傳一次性 `capture_id`，可直接使用截圖內座標呼叫 `click_at`／`scroll` 或固定候選決策工具，省去外部裁圖。Agent 適用操作 Skill 隨包提供；詳見 [安裝、DLL 與 MCP 指南](docs/agent-installation.md) 與 [整合指南](docs/decision-integration.md)。
+MCP 提供 20 個工具，涵蓋無人值守就緒檢查、顯示器／視窗列舉、指定顯示器截圖、移動 App、Win32 控制、找圖、點擊、捲動、文字、快捷鍵、螢幕保護程式，以及 6 個 bounded decision 工具（`decision_observe`、`decision_evaluate`、`decision_act`、`decision_step`、`decision_select`、`decision_status`）。`capture`（喚起前景）與 `decision_observe`（不搶焦點之被動擷取）回傳一次性 `capture_id`，可直接使用截圖內座標呼叫 `click_at`／`scroll` 或固定候選決策工具，省去外部裁圖；遠端決策預設以 `RSGUI_DECISION_IMAGE_RESOLUTION=medium`、`RSGUI_DECISION_MAX_IMAGE_DIM=1280` 等比例縮圖上傳並複用 HTTP Keep-Alive 連線，同時於決策流程預設容忍微小閃爍游標漂移（`allow_caret_drift`）與網頁 `:hover` 變色（`allow_hover`）。Agent 適用操作 Skill 隨包提供；詳見 [安裝、DLL 與 MCP 指南](docs/agent-installation.md) 與 [整合指南](docs/decision-integration.md)。
 
 ## 虛擬顯示器
 

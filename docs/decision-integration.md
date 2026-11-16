@@ -9,10 +9,13 @@ The existing initialization/cancellation/connection lifecycle is retained.
 1. Call `windows_list` with a distinctive title; keep the returned session target.
 2. Call `capture` for explicit initial activation and inspect its image. Subsequent
    `decision_observe` is passive and refuses to steal focus from another window.
-3. Supply the returned `capture_id` and concrete candidates to `decision_evaluate`.
-4. Review the returned decision, then call `decision_act` with only its decision ID.
-   Alternatively call `decision_step` to evaluate and execute in one call.
-5. Inspect the resulting image and use its new `capture_id` for the next step.
+3. Supply the returned `capture_id` and concrete candidates to `decision_evaluate`,
+   then call `decision_act` with the returned `decision_id`, OR call `decision_step`
+   to evaluate and execute in one call, OR call `decision_select` (hybrid web/app
+   selector supporting optional `capture_id` auto-observe/activate, local
+   template/single-candidate fast path, Gemini Decision 1 multi-candidate slow path,
+   and up to 4 bounded `follow_up` `type_text`/`hotkey` steps + one settled capture).
+4. Inspect the resulting image and use its new `capture_id` for the next step.
 
 Example `decision_step` payload (`decision_evaluate` takes the flat `request`
 object without `"request"` or `"wait"`):
@@ -40,12 +43,18 @@ input. Candidate payloads are saved server-side; execution cannot substitute a
 different action. A stale/wrong/consumed decision is rejected. Native calls that
 may change focus, pixels, targets or displays invalidate pending decisions.
 
-The execution boundary checks the full observed frame, target identity,
-foreground state and geometry. Native pointer input additionally checks its
-local pixel patch before and after moving the pointer. The existing corner
-fail-safe, Unicode chunk checks, cancellation and disconnection checks remain.
-Hover effects, caret blinks and animation may invalidate an observation; obtain
-a new capture rather than blindly retrying a possibly delivered action.
+The execution boundary checks the observed frame, target identity, foreground state
+and geometry. `decision_evaluate` preserves `allow_caret_drift: true` internally
+(without a `wait` parameter), and `decision_act`, `decision_step`, and
+`decision_select` default `wait.allow_caret_drift: true` (requiring exact pixel
+matches inside every candidate 32x32 target patch while tolerating small distant
+text-caret blink changes outside target patches) and `wait.allow_hover: true`
+(retaining pointer-move/cursor/bounds/foreground checks while skipping post-move
+target patch abort for browser CSS `:hover` transitions); standalone `click_at`
+and `scroll` retain strict 32x32 patch checks. The existing corner fail-safe,
+Unicode chunk checks, cancellation and disconnection checks remain. Significant
+animation or out-of-patch layout changes may still invalidate an observation;
+obtain a new capture rather than blindly retrying a possibly delivered action.
 
 The local wait polls raw frames at 25 -> 50 -> 100 ms by default, resetting on
 change, and encodes only the returned frame. `outcome=settled` means stable pixels,
@@ -73,28 +82,35 @@ CLI / `~/.gemini-decision-1` presence, and loopback `127.0.0.1:8792/health`
 sidecar probe unless disabled via `RSGUI_DECISION_PROBE_SIDECAR=0`). Alongside the
 Rust `DecisionHook` API, `.agents/hooks.json` +
 `.agents/hooks/prefer-gemini-decision.ps1` provides Antigravity `SessionStart`
-and `PreToolUse` workspace hooks so agents prioritize `decision_observe`,
-`decision_evaluate`, and `decision_step` whenever Gemini Decision 1 is available.
+and `PreToolUse` workspace hooks so agents prioritize `decision_select`,
+`decision_observe`, `decision_evaluate`, and `decision_step` whenever Gemini
+Decision 1 is available.
 
 Google's fixed `https://generativelanguage.googleapis.com/v1beta/decisions`
 endpoint is contacted in `auto` or `gemini` modes for remote decisions, sending
-the selected window PNG (`1..=16,777,216` base64 bytes, up to 12 MiB decoded PNG),
-redacted `goal`, and redacted candidate descriptions. Credentials come only from
-the invoking process environment (`GEMINI_API_KEY` preferred over `GOOGLE_API_KEY`,
-trimmed; `.env` files are not loaded); keys never belong in a plan or Git. Before
-remote requests, common secret patterns and any literal key value are redacted
-from `goal` and `candidate.description`, whereas immutable `candidate.id` values or
-PNG payloads matching the configured key are rejected as `InvalidInput` (without
-fallback, including in `auto` mode). Unrelated windows are not intentionally
-captured, but overlapping windows and sensitive content visible in the selected
-region can appear in screenshots. Review the visible target before opting in.
-There is no screenshot redaction claim.
+a fast downscaled inference PNG (preserving native full-resolution coordinates in
+`CaptureProof`; controlled by `RSGUI_DECISION_MAX_IMAGE_DIM`, default `1280`,
+`0` disables downscaling or `320..=3840`, PNG `1..=16,777,216` base64 bytes /
+up to 12 MiB decoded), redacted `goal`, and redacted candidate descriptions.
+`reqwest::blocking::Client` enables HTTP keep-alive connection pooling and is
+warmed in-process on `decision_observe`, `decision_evaluate`, `decision_step`,
+and `decision_select` without network I/O (`decision_status` remains read-only).
+Credentials come only from the invoking process environment (`GEMINI_API_KEY`
+preferred over `GOOGLE_API_KEY`, trimmed; `.env` files are not loaded); keys
+never belong in a plan or Git. Before remote requests, common secret patterns
+and any literal key value are redacted from `goal` and `candidate.description`,
+whereas immutable `candidate.id` values or PNG payloads matching the configured
+key are rejected as `InvalidInput` (without fallback, including in `auto` mode).
+Unrelated windows are not intentionally captured, but overlapping windows and
+sensitive content visible in the selected region can appear in screenshots.
+Review the visible target before opting in. There is no screenshot redaction claim.
 
 One request batches independent `blocked`/`done`/`next_action` choice questions
 against shared text and image input (`RSGUI_DECISION_IMAGE_RESOLUTION` accepts
-`low` default, `medium`, `high`, or `ultra_high`, trimmed and case-insensitive).
+`low`, `medium` default, `high`, or `ultra_high`, trimmed and case-insensitive).
 The provider returns only bounded choices/probabilities. `minimum_confidence`
-permits `0.5..=1.0` (default `0.85`), while `blocked`/`done` semantics require
+permits `0.5..=1.0` (default `0.85`), `MAX_AMBIGUOUS_NOUL` rejects ambiguous
+multi-candidate choices when `noul > 0.22`, `blocked`/`done` semantics require
 `>= 0.85`, and an explicit provider `"observe"` choice returns `observe`. `auto`
 falls back to `observe` (with `error`, `error_code`, and any returned
 `input_tokens`/`estimated_cost_usd`) on provider failures, refusals, malformed

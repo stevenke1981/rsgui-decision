@@ -25,32 +25,134 @@ fn rect(rect: Rect) -> Value {
 fn display_info(display: &Display) -> Value {
     json!({"device_name":display.name(),"friendly_name":display.friendly_name(),"id":display.id(),"rect":rect(display.bounds()),"primary":display.is_primary(),"coordinates":"windows desktop physical pixels"})
 }
-pub(super) fn encode_png_base64(frame: &Screenshot) -> Result<String> {
-    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+fn encode_png_rgb_bytes(
+    pixels: &[u8],
+    width: u32,
+    height: u32,
+    filter: image::codecs::png::FilterType,
+) -> Result<Vec<u8>> {
+    use image::codecs::png::{CompressionType, PngEncoder};
     use image::{ExtendedColorType, ImageEncoder};
 
-    let expected = usize::try_from(frame.width)
+    let expected = usize::try_from(width)
         .ok()
-        .and_then(|w| w.checked_mul(usize::try_from(frame.height).ok()?))
+        .and_then(|w| w.checked_mul(usize::try_from(height).ok()?))
         .and_then(|px| px.checked_mul(3));
-    if expected != Some(frame.pixels.len()) {
+    if expected != Some(pixels.len()) {
         return Err(Error::InvalidArgument("invalid frame"));
     }
     let mut bytes = Vec::new();
-    PngEncoder::new_with_quality(&mut bytes, CompressionType::Fast, FilterType::Adaptive)
-        .write_image(
-            &frame.pixels,
-            frame.width,
-            frame.height,
-            ExtendedColorType::Rgb8,
-        )
+    PngEncoder::new_with_quality(&mut bytes, CompressionType::Fast, filter)
+        .write_image(pixels, width, height, ExtendedColorType::Rgb8)
         .map_err(|e| Error::Screenshot(e.to_string()))?;
     if bytes.len() > 12 * 1024 * 1024 {
         return Err(Error::InvalidArgument(
             "PNG exceeds 12 MiB; request a smaller region",
         ));
     }
+    Ok(bytes)
+}
+
+pub(super) fn encode_png_base64(frame: &Screenshot) -> Result<String> {
+    let bytes = encode_png_rgb_bytes(
+        &frame.pixels,
+        frame.width,
+        frame.height,
+        image::codecs::png::FilterType::Adaptive,
+    )?;
     Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
+/// Encodes a compact PNG for remote inference, downscaling proportionally to `max_dim` without
+/// altering the caller-visible `CaptureProof` resolution or coordinates.
+pub(super) fn encode_decision_png_base64(frame: &Screenshot, max_dim: u32) -> Result<String> {
+    let expected_len = usize::try_from(frame.width)
+        .ok()
+        .and_then(|w| {
+            usize::try_from(frame.height)
+                .ok()?
+                .checked_mul(w)?
+                .checked_mul(3)
+        })
+        .ok_or(Error::InvalidArgument("invalid frame"))?;
+    if frame.width == 0 || frame.height == 0 || frame.pixels.len() != expected_len {
+        return Err(Error::InvalidArgument("invalid frame"));
+    }
+    let bytes = if max_dim > 0 && (frame.width > max_dim || frame.height > max_dim) {
+        let (target_w, target_h) = if frame.width >= frame.height {
+            let h = ((u64::from(frame.height) * u64::from(max_dim)) / u64::from(frame.width)).max(1)
+                as u32;
+            (max_dim, h)
+        } else {
+            let w = ((u64::from(frame.width) * u64::from(max_dim)) / u64::from(frame.height)).max(1)
+                as u32;
+            (w, max_dim)
+        };
+        let src = image::ImageBuffer::<image::Rgb<u8>, &[u8]>::from_raw(
+            frame.width,
+            frame.height,
+            &frame.pixels,
+        )
+        .ok_or(Error::InvalidArgument("invalid frame"))?;
+        let resized = image::imageops::resize(
+            &src,
+            target_w,
+            target_h,
+            image::imageops::FilterType::Triangle,
+        );
+        encode_png_rgb_bytes(
+            resized.as_raw(),
+            target_w,
+            target_h,
+            image::codecs::png::FilterType::Sub,
+        )?
+    } else {
+        encode_png_rgb_bytes(
+            &frame.pixels,
+            frame.width,
+            frame.height,
+            image::codecs::png::FilterType::Sub,
+        )?
+    };
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
+pub(super) fn load_validated_template(
+    path: &str,
+    confidence: Option<f64>,
+    exact: Option<bool>,
+    scale: Option<f64>,
+) -> Result<(Screenshot, Option<f32>)> {
+    let threshold = if exact.unwrap_or(false) {
+        if confidence.is_some() {
+            return Err(Error::InvalidArgument(
+                "exact and confidence cannot be combined",
+            ));
+        }
+        None
+    } else {
+        let value = confidence.unwrap_or(0.95);
+        if !(0.0..=1.0).contains(&value) || !value.is_finite() {
+            return Err(Error::InvalidArgument("confidence must be 0..1"));
+        }
+        if !cfg!(feature = "opencv") {
+            return Err(Error::FeatureDisabled("opencv"));
+        }
+        Some(value as f32)
+    };
+    if !std::path::Path::new(path).is_absolute() {
+        return Err(Error::InvalidArgument(
+            "template must be an absolute local image path",
+        ));
+    }
+    if std::fs::metadata(path)?.len() > 32 * 1024 * 1024 {
+        return Err(Error::InvalidArgument("template file exceeds 32 MiB"));
+    }
+    let needle = scaled_template(path, scale.unwrap_or(1.0))?;
+    if u64::from(needle.width) * u64::from(needle.height) > 4_194_304 {
+        return Err(Error::InvalidArgument("template exceeds 4 megapixels"));
+    }
+    Ok((needle, threshold))
 }
 fn png(frame: &Screenshot, metadata: Value) -> Result<Value> {
     let data = encode_png_base64(frame)?;
@@ -140,6 +242,28 @@ struct CapturedPoint {
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct DecisionPoint {
+    target: String,
+    capture_id: String,
+    x: i32,
+    y: i32,
+    #[serde(default)]
+    allow_hover: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DecisionScroll {
+    target: String,
+    capture_id: String,
+    x: i32,
+    y: i32,
+    clicks: i32,
+    horizontal: Option<bool>,
+    #[serde(default)]
+    allow_hover: bool,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Scroll {
     target: String,
     capture_id: String,
@@ -205,6 +329,62 @@ impl Session {
         display.validate()?;
         Ok(display.clone())
     }
+    fn acquire_capture_proof(
+        &mut self,
+        target: &str,
+        display_key: Option<&str>,
+        activate: bool,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<CaptureProof> {
+        let display = display_key.map(|key| self.display(key)).transpose()?;
+        let window = self.target(target)?;
+        check()?;
+        if activate {
+            window.activate()?;
+        }
+        active(&window)?;
+        let bounds = window.box_rect()?;
+        check()?;
+        let (region, frame) = if activate {
+            let region = screen_region(self.gui()?, &window, display.as_ref())?;
+            if i64::from(region.width) * i64::from(region.height) > 16_777_216 {
+                return Err(Error::InvalidArgument(
+                    "capture exceeds 16 megapixels; resize window",
+                ));
+            }
+            let frame = capture_region(self.gui()?, display.as_ref(), region)?;
+            (region, frame)
+        } else {
+            let gui = self.gui()?;
+            let mut guard = super::PauseGuard::zero(gui);
+            let region = screen_region(guard.gui(), &window, display.as_ref())?;
+            if i64::from(region.width) * i64::from(region.height) > 16_777_216 {
+                return Err(Error::InvalidArgument(
+                    "capture exceeds 16 megapixels; resize window",
+                ));
+            }
+            let frame = capture_region(guard.gui(), display.as_ref(), region)?;
+            (region, frame)
+        };
+        active(&window)?;
+        if bounds != window.box_rect()? {
+            return Err(Error::InvalidArgument("window moved during capture; retry"));
+        }
+        check()?;
+        self.capture_generation = self
+            .capture_generation
+            .checked_add(1)
+            .ok_or(Error::InvalidArgument("restart session"))?;
+        Ok(CaptureProof {
+            id: format!("c{}", self.capture_generation),
+            target: target.to_owned(),
+            display: display_key.map(str::to_owned),
+            bounds,
+            region,
+            frame,
+            taken: Instant::now(),
+        })
+    }
     pub(crate) fn call(
         &mut self,
         name: &str,
@@ -219,7 +399,10 @@ impl Session {
         }
         // Readiness queries preserve the proof; calls that can change focus,
         // pixels, targets or display references invalidate it even on failure.
-        if !matches!(name, "click_at" | "scroll" | "session_status") {
+        if !matches!(
+            name,
+            "click_at" | "scroll" | "click_at_decision" | "scroll_decision" | "session_status"
+        ) {
             self.capture = None;
         }
         match name {
@@ -350,75 +533,75 @@ impl Session {
             }
             "capture" | "observe" => {
                 let a: Target = decode(args)?;
-                let display = a
-                    .display
-                    .as_deref()
-                    .map(|key| self.display(key))
-                    .transpose()?;
-                let window = self.target(&a.target)?;
-                check()?;
-                if name == "capture" {
-                    window.activate()?;
-                }
-                active(&window)?;
-                let bounds = window.box_rect()?;
-                check()?;
-                let region = screen_region(self.gui()?, &window, display.as_ref())?;
-                if i64::from(region.width) * i64::from(region.height) > 16_777_216 {
-                    return Err(Error::InvalidArgument(
-                        "capture exceeds 16 megapixels; resize window",
-                    ));
-                }
-                let frame = capture_region(self.gui()?, display.as_ref(), region)?;
-                active(&window)?;
-                if bounds != window.box_rect()? {
-                    return Err(Error::InvalidArgument("window moved during capture; retry"));
-                }
-                check()?;
-                self.capture_generation = self
-                    .capture_generation
-                    .checked_add(1)
-                    .ok_or(Error::InvalidArgument("restart session"))?;
-                let id = format!("c{}", self.capture_generation);
-                let output = png(
-                    &frame,
-                    json!({"target":a.target,"display":a.display,"region":rect(region),"coordinates":"windows desktop physical pixels","capture_id":id,"pointer_coordinates":"image-relative pixels; origin at captured image top-left","expires_in_seconds":60,"single_use":true}),
+                let proof = self.acquire_capture_proof(
+                    &a.target,
+                    a.display.as_deref(),
+                    name == "capture",
+                    check,
                 )?;
-                let taken = Instant::now();
+                let output = png(
+                    &proof.frame,
+                    json!({"target":proof.target,"display":proof.display,"region":rect(proof.region),"coordinates":"windows desktop physical pixels","capture_id":proof.id,"pointer_coordinates":"image-relative pixels; origin at captured image top-left","expires_in_seconds":60,"single_use":true}),
+                )?;
                 self.capture = Some(CaptureProof {
-                    id,
-                    target: a.target,
-                    display: a.display,
-                    bounds,
-                    region,
-                    frame,
-                    taken,
+                    taken: Instant::now(),
+                    ..proof
                 });
                 Ok(output)
             }
-            "click_at" | "scroll" => {
+            "click_at" | "scroll" | "click_at_decision" | "scroll_decision" => {
                 let proof = self.capture.take().ok_or(Error::InvalidArgument(
                     "no unused window capture; call capture first",
                 ))?;
-                let (a, scroll) = if name == "scroll" {
-                    let a: Scroll = decode(args)?;
-                    if a.clicks == 0 || !(-100..=100).contains(&a.clicks) {
-                        return Err(Error::InvalidArgument(
-                            "scroll clicks must be -100..100 and nonzero",
-                        ));
+                let (a, scroll, allow_hover) = match name {
+                    "scroll" => {
+                        let a: Scroll = decode(args)?;
+                        (
+                            CapturedPoint {
+                                target: a.target,
+                                capture_id: a.capture_id,
+                                x: a.x,
+                                y: a.y,
+                            },
+                            Some((a.clicks, a.horizontal.unwrap_or(false))),
+                            false,
+                        )
                     }
-                    (
-                        CapturedPoint {
-                            target: a.target,
-                            capture_id: a.capture_id,
-                            x: a.x,
-                            y: a.y,
-                        },
-                        Some((a.clicks, a.horizontal.unwrap_or(false))),
-                    )
-                } else {
-                    (decode::<CapturedPoint>(args)?, None)
+                    "scroll_decision" => {
+                        let a: DecisionScroll = decode(args)?;
+                        (
+                            CapturedPoint {
+                                target: a.target,
+                                capture_id: a.capture_id,
+                                x: a.x,
+                                y: a.y,
+                            },
+                            Some((a.clicks, a.horizontal.unwrap_or(false))),
+                            a.allow_hover,
+                        )
+                    }
+                    "click_at_decision" => {
+                        let a: DecisionPoint = decode(args)?;
+                        (
+                            CapturedPoint {
+                                target: a.target,
+                                capture_id: a.capture_id,
+                                x: a.x,
+                                y: a.y,
+                            },
+                            None,
+                            a.allow_hover,
+                        )
+                    }
+                    _ => (decode::<CapturedPoint>(args)?, None, false),
                 };
+                if let Some((clicks, _)) = scroll
+                    && (clicks == 0 || !(-100..=100).contains(&clicks))
+                {
+                    return Err(Error::InvalidArgument(
+                        "scroll clicks must be -100..100 and nonzero",
+                    ));
+                }
                 let point = proof.point(&a.target, &a.capture_id, a.x, a.y)?;
                 let window = self.target(&a.target)?;
                 let display = proof
@@ -431,7 +614,11 @@ impl Session {
                     let mut guard = super::PauseGuard::zero(gui);
                     proof.verify(guard.gui(), &window, display.as_ref(), point, check)?;
                     super::move_cursor_and_wait(guard.gui(), display.as_ref(), point, check)?;
-                    proof.verify(guard.gui(), &window, display.as_ref(), point, check)?;
+                    if allow_hover {
+                        proof.verify_geometry(guard.gui(), &window, display.as_ref(), check)?;
+                    } else {
+                        proof.verify(guard.gui(), &window, display.as_ref(), point, check)?;
+                    }
                     let actual = guard.gui().position()?;
                     if actual != point {
                         eprintln!(
@@ -462,35 +649,8 @@ impl Session {
                 if !(0.0..=30.0).contains(&timeout) {
                     return Err(Error::InvalidArgument("timeout must be 0..30 seconds"));
                 }
-                let confidence = if a.exact.unwrap_or(false) {
-                    if a.confidence.is_some() {
-                        return Err(Error::InvalidArgument(
-                            "exact and confidence cannot be combined",
-                        ));
-                    }
-                    None
-                } else {
-                    let value = a.confidence.unwrap_or(0.95);
-                    if !(0.0..=1.0).contains(&value) {
-                        return Err(Error::InvalidArgument("confidence must be 0..1"));
-                    }
-                    if !cfg!(feature = "opencv") {
-                        return Err(Error::FeatureDisabled("opencv"));
-                    }
-                    Some(value as f32)
-                };
-                if !std::path::Path::new(&a.template).is_absolute() {
-                    return Err(Error::InvalidArgument(
-                        "template must be an absolute local image path",
-                    ));
-                }
-                if std::fs::metadata(&a.template)?.len() > 32 * 1024 * 1024 {
-                    return Err(Error::InvalidArgument("template file exceeds 32 MiB"));
-                }
-                let needle = scaled_template(&a.template, a.scale.unwrap_or(1.0))?;
-                if u64::from(needle.width) * u64::from(needle.height) > 4_194_304 {
-                    return Err(Error::InvalidArgument("template exceeds 4 megapixels"));
-                }
+                let (needle, confidence) =
+                    load_validated_template(&a.template, a.confidence, a.exact, a.scale)?;
                 let window = self.target(&a.target)?;
                 check()?;
                 window.activate()?;
@@ -807,6 +967,35 @@ mod tests {
         };
         assert!(matches!(
             encode_png_base64(&bad),
+            Err(Error::InvalidArgument(_))
+        ));
+
+        let large = Screenshot::solid(2000, 1000, autogui::Rgb::new(10, 20, 30));
+        let scaled_b64 = encode_decision_png_base64(&large, 1280).unwrap();
+        let scaled_bytes = base64::engine::general_purpose::STANDARD
+            .decode(scaled_b64)
+            .unwrap();
+        let decoded =
+            image::load_from_memory_with_format(&scaled_bytes, image::ImageFormat::Png).unwrap();
+        assert_eq!(decoded.width(), 1280);
+        assert_eq!(decoded.height(), 640);
+
+        let zero_axis = Screenshot {
+            width: 0,
+            height: 2000,
+            pixels: Vec::new(),
+        };
+        assert!(matches!(
+            encode_decision_png_base64(&zero_axis, 1280),
+            Err(Error::InvalidArgument(_))
+        ));
+        let extra_pixels = Screenshot {
+            width: 2000,
+            height: 1000,
+            pixels: vec![0; 2000 * 1000 * 3 + 3],
+        };
+        assert!(matches!(
+            encode_decision_png_base64(&extra_pixels, 1280),
             Err(Error::InvalidArgument(_))
         ));
     }

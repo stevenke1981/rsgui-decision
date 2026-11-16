@@ -146,7 +146,7 @@ if ($eventName -eq 'PreToolUse') {
     if ($presence.Detected) {
         Emit-Json @{
             decision = 'allow'
-            reason = "Gemini Decision 1 detected (mode=$($presence.Mode), api_key=$($presence.ApiKeyConfigured), cli=$($presence.GeminiCoreCli), sidecar=$($presence.SidecarHealthy)). Prefer decision_observe + decision_evaluate/decision_step with bounded candidates when selecting UI actions."
+            reason = "Gemini Decision 1 detected (mode=$($presence.Mode), api_key=$($presence.ApiKeyConfigured), cli=$($presence.GeminiCoreCli), sidecar=$($presence.SidecarHealthy)). Prefer decision_select or decision_observe + decision_evaluate/decision_step with bounded candidates when selecting UI actions."
         }
     } else {
         Emit-Json @{ decision = 'allow' }
@@ -157,7 +157,7 @@ if ($eventName -eq 'PreToolUse') {
 if ($eventName -eq 'SessionStart' -or $eventName -eq 'PreInvocation') {
     $presence = Get-Presence -IncludeSidecar
     if ($presence.Detected) {
-        $message = "Gemini Decision 1 is available (mode=$($presence.Mode), api_key=$($presence.ApiKeyConfigured), cli=$($presence.GeminiCoreCli), sidecar=$($presence.SidecarHealthy)). Prioritize rsgui-decision MCP tools (decision_status, decision_observe, decision_evaluate, decision_step) with 2+ concrete candidates for visual UI choices so Gemini Decision 1 evaluates first before local fallback."
+        $message = "Gemini Decision 1 is available (mode=$($presence.Mode), api_key=$($presence.ApiKeyConfigured), cli=$($presence.GeminiCoreCli), sidecar=$($presence.SidecarHealthy)). Prioritize rsgui-decision MCP tools (decision_status, decision_select, decision_observe, decision_evaluate, decision_step) with concrete candidates for visual UI choices so Gemini Decision 1 and fast local template paths optimize web/app selection."
         Emit-Json @{
             injectSteps = @(
                 @{

@@ -64,12 +64,11 @@ impl CaptureProof {
         ))
     }
 
-    pub fn verify(
+    pub fn verify_geometry(
         &self,
         gui: &mut AutoGui,
         window: &Window,
         display: Option<&Display>,
-        point: Point,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<()> {
         check()?;
@@ -81,25 +80,95 @@ impl CaptureProof {
                 "window/display geometry changed; capture again",
             ));
         }
+        if let Some(display) = display {
+            display.validate()?;
+        }
+        check()?;
+        Ok(())
+    }
+
+    pub fn verify(
+        &self,
+        gui: &mut AutoGui,
+        window: &Window,
+        display: Option<&Display>,
+        point: Point,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        self.verify_geometry(gui, window, display, check)?;
         let (region, expected) = self.patch(point)?;
         if capture_region(gui, display, region)? != expected {
             return Err(Error::InvalidArgument(
                 "pixels or hover changed; cursor may be positioned; capture again before retrying",
             ));
         }
-        check()?;
-        self.fresh()?;
-        active(window)?;
-        if window.box_rect()? != self.bounds {
-            return Err(Error::InvalidArgument(
-                "window moved before input; capture again",
-            ));
-        }
-        if let Some(display) = display {
-            display.validate()?;
-        }
+        self.verify_geometry(gui, window, display, check)?;
         Ok(())
     }
+}
+
+/// Checks whether `actual` matches `expected` cleanly. Exact match returns immediately; when
+/// `allow_caret_drift` is true, permits tiny out-of-target pixel changes (e.g., blinking text caret
+/// up to max(64, min(2500, total_pixels / 1000)) pixels) while strictly rejecting any change inside
+/// candidate click/scroll 32x32 local patches.
+pub(super) fn frames_match_with_tolerance(
+    expected: &Screenshot,
+    actual: &Screenshot,
+    protected_local_points: &[Point],
+    allow_caret_drift: bool,
+) -> bool {
+    if expected.width != actual.width
+        || expected.height != actual.height
+        || expected.pixels.len() != actual.pixels.len()
+    {
+        return false;
+    }
+    if expected.pixels == actual.pixels {
+        return true;
+    }
+    if !allow_caret_drift || expected.width == 0 || expected.height == 0 {
+        return false;
+    }
+    let width = expected.width as usize;
+    let height = expected.height as usize;
+    let row_bytes = width * 3;
+    if expected.pixels.len() != height * row_bytes {
+        return false;
+    }
+    for point in protected_local_points {
+        let left = (point.x - 16).max(0) as usize;
+        let top = (point.y - 16).max(0) as usize;
+        let right = (i64::from(point.x) + 16).min(expected.width as i64).max(0) as usize;
+        let bottom = (i64::from(point.y) + 16).min(expected.height as i64).max(0) as usize;
+        if left >= right || top >= bottom {
+            return false;
+        }
+        for row in top..bottom {
+            let start = row * row_bytes + left * 3;
+            let end = row * row_bytes + right * 3;
+            if expected.pixels[start..end] != actual.pixels[start..end] {
+                return false;
+            }
+        }
+    }
+    let total_pixels = width * height;
+    let budget = (total_pixels / 1000).clamp(64, 2500);
+    let mut changed = 0usize;
+    for (a, b) in expected
+        .pixels
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(actual.pixels.as_chunks::<3>().0.iter())
+    {
+        if a != b {
+            changed += 1;
+            if changed > budget {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 pub(super) fn validate_type_text(text: &str, min_chars: usize) -> Result<()> {
@@ -243,5 +312,49 @@ mod tests {
         assert!(validate_hotkey(&["insert".into()]).is_ok());
         assert!(validate_hotkey(&["ctrl".into(), "not_a_real_key".into()]).is_err());
         assert!(validate_hotkey(&[]).is_err());
+    }
+
+    #[test]
+    fn caret_drift_tolerance_allows_tiny_distant_caret_but_blocks_target_or_large_changes() {
+        let base = Screenshot::solid(200, 100, Rgb::new(10, 20, 30));
+        let mut caret = base.clone();
+        // Flip a 2x16 caret at top-left (32 px <= 64 budget), distant from click target (150, 50).
+        for y in 0..16 {
+            for x in 0..2 {
+                let idx = (y * 200 + x) * 3;
+                caret.pixels[idx] = 255;
+            }
+        }
+        let target = Point::new(150, 50);
+        assert!(!frames_match_with_tolerance(
+            &base,
+            &caret,
+            &[target],
+            false
+        ));
+        assert!(frames_match_with_tolerance(&base, &caret, &[target], true));
+
+        // Flip inside the 32x32 protected patch around target (150, 50): must fail even with drift.
+        let mut target_changed = base.clone();
+        let idx = (50 * 200 + 150) * 3;
+        target_changed.pixels[idx] = 255;
+        assert!(!frames_match_with_tolerance(
+            &base,
+            &target_changed,
+            &[target],
+            true
+        ));
+
+        // Flip 80 pixels outside target (> 64 budget on 200x100 frame): must fail.
+        let mut layout_shift = base.clone();
+        for x in 0..80 {
+            layout_shift.pixels[x * 3] = 255;
+        }
+        assert!(!frames_match_with_tolerance(
+            &base,
+            &layout_shift,
+            &[target],
+            true
+        ));
     }
 }
