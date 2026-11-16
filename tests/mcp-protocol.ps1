@@ -120,6 +120,10 @@ foreach ($targetExe in $Executable) {
         Assert ($stepNoCapture.isError -and $stepNoCapture.content[0].text -match 'capture|observe') "decision_step error unclear: $($stepNoCapture.content[0].text)"
         $selectBadField=Tool $client decision_select @{target='never-existed';goal='test';candidates=@($candidate);extra=$true}
         Assert $selectBadField.isError 'decision_select accepted unknown field'
+        $selectBadReturn=Tool $client decision_select @{target='never-existed';goal='test';candidates=@($candidate);return_image='no'}
+        Assert $selectBadReturn.isError 'decision_select accepted non-boolean return_image'
+        $selectSchema=$list.result.tools | Where-Object { $_.name -eq 'decision_select' } | Select-Object -First 1
+        Assert ($selectSchema.inputSchema.properties.follow_up.maxItems -eq 8 -and $selectSchema.inputSchema.properties.return_image.default -eq $true) 'Unexpected decision_select schema limits'
         $selectMissingTarget=Tool $client decision_select @{target='never-existed';goal='test';candidates=@($candidate)}
         Assert ($selectMissingTarget.isError -and $selectMissingTarget.content[0].text -match 'target') "decision_select error unclear: $($selectMissingTarget.content[0].text)"
         $status=Tool $client screensaver @{action='status'}

@@ -20,7 +20,7 @@ use thiserror::Error;
 const ENDPOINT: &str = "https://generativelanguage.googleapis.com/v1beta/decisions";
 const MODEL: &str = "gemini-decision-1";
 const SIDECAR_PORT: u16 = 8792;
-const SIDECAR_PROBE_TIMEOUT: Duration = Duration::from_millis(25);
+const SIDECAR_PROBE_TIMEOUT: Duration = Duration::from_millis(10);
 const CATCHALLS: [&str; 4] = ["observe", "wait", "stop", "done"];
 // Matches the desktop executor's 12 MiB PNG ceiling after base64 expansion.
 const MAX_IMAGE_BASE64: usize = 16 * 1024 * 1024;
@@ -348,23 +348,63 @@ impl Engine {
     /// Defaults to `auto` (prioritizes Gemini Decision 1 when configured, falling back to local
     /// on provider failures). Explicit `RSGUI_DECISION_MODE=local|auto|gemini` overrides.
     pub fn from_env() -> Result<Self, Error> {
+        let mut engine = Self::from_env_runtime()?;
+        if engine.mode != Mode::Local {
+            engine.discovery =
+                Self::probe_discovery_inner(engine.mode, engine.provider.is_some(), None)?;
+        }
+        Ok(engine)
+    }
+
+    /// Initializes the engine from environment configuration without scanning `PATH` or probing the
+    /// local sidecar port, keeping acting MCP paths free of startup filesystem/socket waits.
+    pub fn from_env_runtime() -> Result<Self, Error> {
         let mut engine = Self::from_configuration(read_env_unicode)?;
         if engine.mode != Mode::Local {
-            let probe_sidecar =
-                parse_probe_sidecar(read_env_unicode("RSGUI_DECISION_PROBE_SIDECAR")?.as_deref())?;
             engine.discovery = GeminiDiscovery {
                 api_key_configured: engine.provider.is_some(),
-                gemini_core_cli: find_gemini_core_installation(),
-                sidecar_healthy: probe_sidecar
-                    && probe_sidecar_health(
-                        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), SIDECAR_PORT),
-                        SIDECAR_PROBE_TIMEOUT,
-                    ),
-                available: false,
+                ..GeminiDiscovery::default()
             }
             .finalize();
         }
         Ok(engine)
+    }
+
+    /// Probes non-secret Gemini Decision 1 discovery metadata, reusing a caller-provided CLI lookup
+    /// cache so repeated `decision_status` calls avoid re-scanning `PATH`.
+    pub fn probe_discovery_cached(
+        mode: Mode,
+        api_key_configured: bool,
+        cached_cli: &mut Option<bool>,
+    ) -> Result<GeminiDiscovery, Error> {
+        Self::probe_discovery_inner(mode, api_key_configured, Some(cached_cli))
+    }
+
+    fn probe_discovery_inner(
+        mode: Mode,
+        api_key_configured: bool,
+        cached_cli: Option<&mut Option<bool>>,
+    ) -> Result<GeminiDiscovery, Error> {
+        if mode == Mode::Local {
+            return Ok(GeminiDiscovery::default());
+        }
+        let probe_sidecar =
+            parse_probe_sidecar(read_env_unicode("RSGUI_DECISION_PROBE_SIDECAR")?.as_deref())?;
+        let gemini_core_cli = match cached_cli {
+            Some(slot) => *slot.get_or_insert_with(find_gemini_core_installation),
+            None => find_gemini_core_installation(),
+        };
+        Ok(GeminiDiscovery {
+            api_key_configured,
+            gemini_core_cli,
+            sidecar_healthy: probe_sidecar
+                && probe_sidecar_health(
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), SIDECAR_PORT),
+                    SIDECAR_PROBE_TIMEOUT,
+                ),
+            available: false,
+        }
+        .finalize())
     }
 
     fn from_configuration(

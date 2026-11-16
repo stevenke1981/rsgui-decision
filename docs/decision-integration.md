@@ -14,7 +14,9 @@ The existing initialization/cancellation/connection lifecycle is retained.
    to evaluate and execute in one call, OR call `decision_select` (hybrid web/app
    selector supporting optional `capture_id` auto-observe/activate, local
    template/single-candidate fast path, Gemini Decision 1 multi-candidate slow path,
-   and up to 4 bounded `follow_up` `type_text`/`hotkey` steps + one settled capture).
+   up to 8 bounded `follow_up` `type_text`/`hotkey`/`click`/`scroll`/`click_template`
+   steps, and optional `return_image: false` to omit intermediate PNG encoding/payloads
+   while still returning a fresh `capture_id`).
 4. Inspect the resulting image and use its new `capture_id` for the next step.
 
 Example `decision_step` payload (`decision_evaluate` takes the flat `request`

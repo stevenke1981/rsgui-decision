@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::io::{Error, Result};
 use std::sync::{
-    Arc, Mutex,
+    Arc, Mutex, OnceLock,
     atomic::{AtomicBool, Ordering},
     mpsc,
 };
@@ -31,13 +31,17 @@ pub(crate) const NAMES: &[&str] = &[
     "decision_select",
     "decision_status",
 ];
-pub(crate) fn definitions() -> Value {
-    let mut tools: Vec<Value> =
-        serde_json::from_str(include_str!("mcp_tools.json")).expect("embedded native tool schema");
-    let decision: Vec<Value> = serde_json::from_str(include_str!("decision_tools.json"))
-        .expect("embedded decision tool schema");
-    tools.extend(decision);
-    Value::Array(tools)
+static DEFINITIONS: OnceLock<Value> = OnceLock::new();
+
+pub(crate) fn definitions() -> &'static Value {
+    DEFINITIONS.get_or_init(|| {
+        let mut tools: Vec<Value> = serde_json::from_str(include_str!("mcp_tools.json"))
+            .expect("embedded native tool schema");
+        let decision: Vec<Value> = serde_json::from_str(include_str!("decision_tools.json"))
+            .expect("embedded decision tool schema");
+        tools.extend(decision);
+        Value::Array(tools)
+    })
 }
 pub(crate) trait Handler {
     fn call(&mut self, name: &str, args: Value, check: &dyn Fn() -> Result<()>) -> Result<Value>;

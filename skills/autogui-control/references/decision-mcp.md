@@ -18,4 +18,5 @@
 
 - Dynamic web UIs (CSS hover fades, popover animations, post-typing reflows) can exceed `allow_caret_drift` tolerances while inspecting a screenshot, causing `observed pixels/display changed; observe again` on a prior `capture_id`.
 - Omit `capture_id` in `decision_select` (`activate: true`, or `false` if already focused) when acting on dynamic web overlays so an atomic baseline frame is captured immediately before execution.
+- **Multi-step chaining in 1 roundtrip**: Chain up to 8 `follow_up` steps (`type_text`, `hotkey`, `click`, `scroll`, and live-matched `click_template`) inside `decision_select`, and set `return_image: false` on intermediate steps (keeping `true` on the final verification call) to skip PNG encoding/offload and extra `read_file` vision turns while preserving `capture_id` issuance.
 - Clicking outside an open web modal/popover may dismiss the backdrop without focusing an underlying textarea; capture/inspect caret focus after dismissal before running `type_text`.
