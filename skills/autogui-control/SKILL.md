@@ -48,4 +48,4 @@ Virtual monitors require a separately installed Windows IDD driver and an active
 
 All displays in one Windows session share cursor, keyboard and foreground focus. A virtual monitor does not provide an isolated input session or bypass the lock screen. UI Automation/OCR, arbitrary Win32 messages, shell execution and force-terminating apps are not provided. The native library uses Win32 window APIs, Enigo input, and checked virtual-desktop SendInput for explicit display clicks.
 
-See [CLI and installation reference](references/cli.md) for fallback commands. Do not change host approval policies to enable this tool.
+See [Decision MCP & Gemini Decision 1 runbook](references/decision-mcp.md) for credential preflight, multi-candidate visual descriptions, and dynamic web overlays, and [CLI and installation reference](references/cli.md) for fallback commands. Do not change host approval policies to enable this tool.
