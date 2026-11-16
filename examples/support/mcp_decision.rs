@@ -4,17 +4,18 @@ use super::input::{
 };
 use super::{
     PauseGuard, Session, active, capture_region, decode, encode_decision_png_base64,
-    load_validated_template, png, rect, screen_region, text,
+    load_validated_template, locate_unique_centers, png, rect, screen_region, send_pointer_at,
+    text,
 };
-use autogui::{
-    AutoGui, Error, FakeBackend, LocateOptions, Point, Rect, Result, Screenshot, center,
-};
+use autogui::{AutoGui, Display, Error, Point, Rect, Result, Screenshot, Window};
 use rsgui_decision_core::{
     ActionDecision, Candidate, Decision, DecisionInput, Engine, Error as DecisionError, Facts, Mode,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
+
+const MAX_SELECT_FOLLOW_UP: usize = 8;
 
 pub(super) const NAMES: &[&str] = &[
     "decision_observe",
@@ -28,6 +29,7 @@ pub(super) const NAMES: &[&str] = &[
 #[derive(Default)]
 pub(super) struct State {
     engine: Option<Engine>,
+    cached_gemini_cli: Option<bool>,
     pub(super) pending: Option<Pending>,
     generation: u64,
     evaluations: u64,
@@ -167,6 +169,29 @@ enum FollowUpAction {
         #[serde(default)]
         delay_ms: u64,
     },
+    Click {
+        x: i32,
+        y: i32,
+        #[serde(default)]
+        delay_ms: u64,
+    },
+    Scroll {
+        x: i32,
+        y: i32,
+        clicks: i32,
+        #[serde(default)]
+        horizontal: bool,
+        #[serde(default)]
+        delay_ms: u64,
+    },
+    ClickTemplate {
+        template: SelectTemplate,
+        #[serde(default)]
+        delay_ms: u64,
+    },
+}
+fn default_return_image() -> bool {
+    true
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -182,6 +207,8 @@ struct SelectRequest {
     follow_up: Vec<FollowUpAction>,
     #[serde(default = "default_confidence")]
     minimum_confidence: f64,
+    #[serde(default = "default_return_image")]
+    return_image: bool,
     #[serde(default)]
     wait: WaitPolicy,
 }
@@ -264,35 +291,67 @@ impl GuiAction {
 }
 
 impl FollowUpAction {
-    fn validate(&self) -> Result<()> {
+    fn validate(&self) -> Result<Option<(Screenshot, Option<f32>)>> {
+        let delay_ms = self.delay_ms();
+        if delay_ms > 500 {
+            return Err(Error::InvalidArgument("follow_up delay_ms must be 0..500"));
+        }
         match self {
-            Self::TypeText { text, delay_ms } => {
-                if *delay_ms > 500 {
-                    return Err(Error::InvalidArgument("follow_up delay_ms must be 0..500"));
-                }
-                validate_type_text(text, 1)
+            Self::TypeText { text, .. } => {
+                validate_type_text(text, 1)?;
+                Ok(None)
             }
-            Self::Hotkey { keys, delay_ms } => {
-                if *delay_ms > 500 {
-                    return Err(Error::InvalidArgument("follow_up delay_ms must be 0..500"));
-                }
-                validate_hotkey(keys)
+            Self::Hotkey { keys, .. } => {
+                validate_hotkey(keys)?;
+                Ok(None)
             }
+            Self::Click { x, y, .. } => {
+                if *x < 0 || *y < 0 {
+                    return Err(Error::InvalidArgument(
+                        "follow_up click coordinates must be non-negative",
+                    ));
+                }
+                Ok(None)
+            }
+            Self::Scroll { x, y, clicks, .. } => {
+                if *x < 0 || *y < 0 {
+                    return Err(Error::InvalidArgument(
+                        "follow_up scroll coordinates must be non-negative",
+                    ));
+                }
+                if *clicks == 0 || !(-100..=100).contains(clicks) {
+                    return Err(Error::InvalidArgument(
+                        "scroll clicks must be nonzero and within -100..100",
+                    ));
+                }
+                Ok(None)
+            }
+            Self::ClickTemplate { template, .. } => Ok(Some(load_validated_template(
+                &template.path,
+                template.confidence,
+                template.exact,
+                template.scale,
+            )?)),
+        }
+    }
+
+    fn validate_against_proof(&self, proof: &CaptureProof) -> Result<()> {
+        match self {
+            Self::Click { x, y, .. } | Self::Scroll { x, y, .. } => {
+                proof.point(&proof.target, &proof.id, *x, *y)?;
+                Ok(())
+            }
+            Self::TypeText { .. } | Self::Hotkey { .. } | Self::ClickTemplate { .. } => Ok(()),
         }
     }
 
     fn delay_ms(&self) -> u64 {
         match self {
-            Self::TypeText { delay_ms, .. } | Self::Hotkey { delay_ms, .. } => *delay_ms,
-        }
-    }
-
-    fn native(&self, target: &str) -> (&'static str, Value) {
-        match self {
-            Self::TypeText { text, .. } => {
-                ("type_text_passive", json!({"target":target,"text":text}))
-            }
-            Self::Hotkey { keys, .. } => ("hotkey_passive", json!({"target":target,"keys":keys})),
+            Self::TypeText { delay_ms, .. }
+            | Self::Hotkey { delay_ms, .. }
+            | Self::Click { delay_ms, .. }
+            | Self::Scroll { delay_ms, .. }
+            | Self::ClickTemplate { delay_ms, .. } => *delay_ms,
         }
     }
 }
@@ -404,11 +463,17 @@ impl Session {
                 let engine = if let Some(engine) = self.decisions.engine.as_ref() {
                     engine
                 } else {
-                    probe = Engine::from_env().map_err(map_decision_error)?;
+                    probe = Engine::from_env_runtime().map_err(map_decision_error)?;
                     &probe
                 };
                 let mode = engine.mode();
                 let provider_model = (mode != Mode::Local).then_some("gemini-decision-1");
+                let discovery = Engine::probe_discovery_cached(
+                    mode,
+                    engine.has_provider(),
+                    &mut self.decisions.cached_gemini_cli,
+                )
+                .map_err(map_decision_error)?;
                 Ok(text(json!({"mode":mode,
                     "evaluations":self.decisions.evaluations,"action_attempts":self.decisions.action_attempts,
                     "pending_decision":self.decisions.pending.as_ref().map(|pending| &pending.id),
@@ -417,7 +482,7 @@ impl Session {
                     "image_resolution":engine.image_resolution(),
                     "max_image_dim":max_image_dim,
                     "hook":engine.hook_name(),
-                    "gemini_decision_1":engine.discovery(),
+                    "gemini_decision_1":discovery,
                     "automatic_retries":false,
                     "scope":"bounded GUI decisions; auto prioritizes Gemini Decision 1 when available and falls back safely; local single-candidate mode is deterministic"})))
             }
@@ -500,7 +565,7 @@ impl Session {
 
     fn decision_engine(&mut self) -> Result<()> {
         if self.decisions.engine.is_none() {
-            let engine = Engine::from_env().map_err(map_decision_error)?;
+            let engine = Engine::from_env_runtime().map_err(map_decision_error)?;
             engine.warm_up_client();
             self.decisions.engine = Some(engine);
         }
@@ -710,13 +775,14 @@ impl Session {
             request.candidates.len(),
             request.minimum_confidence,
         )?;
-        if request.follow_up.len() > 4 {
+        if request.follow_up.len() > MAX_SELECT_FOLLOW_UP {
             return Err(Error::InvalidArgument(
-                "follow_up supports at most 4 actions",
+                "follow_up supports at most 8 actions",
             ));
         }
+        let mut preloaded_follow_up = Vec::with_capacity(request.follow_up.len());
         for step in &request.follow_up {
-            step.validate()?;
+            preloaded_follow_up.push(step.validate()?);
         }
         let mut ids = std::collections::BTreeSet::new();
         let mut preloaded_templates = Vec::with_capacity(request.candidates.len());
@@ -788,6 +854,9 @@ impl Session {
                         action.validate(proof)?;
                     }
                 }
+                for step in &request.follow_up {
+                    step.validate_against_proof(proof)?;
+                }
             }
             let proof = self.capture.take().ok_or(Error::InvalidArgument(
                 "capture/observe the selected window first",
@@ -811,6 +880,9 @@ impl Session {
                 if let Some(action) = &candidate.action {
                     action.validate(&proof)?;
                 }
+            }
+            for step in &request.follow_up {
+                step.validate_against_proof(&proof)?;
             }
             proof
         };
@@ -943,6 +1015,7 @@ impl Session {
         let display = proof.display.clone();
         let target = proof.target.clone();
         let expected_bounds = proof.bounds;
+        let expected_region = proof.region;
         let (name, action_args) = candidate
             .action
             .native(&target, &proof.id, wait.allow_hover);
@@ -969,22 +1042,17 @@ impl Session {
 
         let mut follow_up_completed = 0usize;
         let follow_up_total = request.follow_up.len();
-        for step in &request.follow_up {
-            if let Err(error) = sleep_checked(Duration::from_millis(step.delay_ms()), check)
-                .and_then(|()| {
-                    let window = self.target(&target)?;
-                    active(&window)?;
-                    if window.box_rect()? != expected_bounds {
-                        return Err(Error::InvalidArgument(
-                            "window moved during follow_up; inspect before retrying",
-                        ));
-                    }
-                    let (step_name, step_args) = step.native(&target);
-                    self.decisions.action_attempts += 1;
-                    self.call(step_name, step_args, check)?;
-                    Ok(())
-                })
-            {
+        for (idx, step) in request.follow_up.iter().enumerate() {
+            let preloaded = preloaded_follow_up.get(idx).and_then(Option::as_ref);
+            if let Err(error) = self.execute_follow_up_step(
+                &target,
+                display.as_deref(),
+                expected_bounds,
+                expected_region,
+                step,
+                preloaded,
+                check,
+            ) {
                 self.capture = None;
                 return Ok(
                     json!({"isError":true,"content":[{"type":"text","text":json!({
@@ -1011,8 +1079,15 @@ impl Session {
             capture_id: String::new(),
             candidate,
         };
-        let mut output =
-            self.finish_observation(&pending, display, primary_receipt, wait, started, check)?;
+        let mut output = self.finish_observation(
+            &pending,
+            display,
+            primary_receipt,
+            wait,
+            request.return_image,
+            started,
+            check,
+        )?;
         if let Some(content) = output["content"].as_array_mut()
             && let Some(first) = content.first_mut()
             && let Some(raw) = first["text"].as_str()
@@ -1025,6 +1100,162 @@ impl Session {
             first["text"] = json!(Value::Object(obj).to_string());
         }
         Ok(output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_follow_up_step(
+        &mut self,
+        target: &str,
+        display_key: Option<&str>,
+        expected_bounds: Rect,
+        expected_region: Rect,
+        step: &FollowUpAction,
+        preloaded_template: Option<&(Screenshot, Option<f32>)>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        sleep_checked(Duration::from_millis(step.delay_ms()), check)?;
+        let window = self.target(target)?;
+        active(&window)?;
+        if window.box_rect()? != expected_bounds {
+            return Err(Error::InvalidArgument(
+                "window moved during follow_up; inspect before retrying",
+            ));
+        }
+        match step {
+            FollowUpAction::TypeText { text, .. } => {
+                self.decisions.action_attempts += 1;
+                self.call(
+                    "type_text_passive",
+                    json!({"target": target, "text": text}),
+                    check,
+                )?;
+            }
+            FollowUpAction::Hotkey { keys, .. } => {
+                self.decisions.action_attempts += 1;
+                self.call(
+                    "hotkey_passive",
+                    json!({"target": target, "keys": keys}),
+                    check,
+                )?;
+            }
+            FollowUpAction::Click { x, y, .. } => {
+                let point = Point::new(expected_region.left + *x, expected_region.top + *y);
+                self.dispatch_follow_up_pointer(
+                    &window,
+                    display_key,
+                    expected_bounds,
+                    expected_region,
+                    point,
+                    None,
+                    check,
+                )?;
+            }
+            FollowUpAction::Scroll {
+                x,
+                y,
+                clicks,
+                horizontal,
+                ..
+            } => {
+                let point = Point::new(expected_region.left + *x, expected_region.top + *y);
+                self.dispatch_follow_up_pointer(
+                    &window,
+                    display_key,
+                    expected_bounds,
+                    expected_region,
+                    point,
+                    Some((*clicks, *horizontal)),
+                    check,
+                )?;
+            }
+            FollowUpAction::ClickTemplate { .. } => {
+                let (needle, confidence) = preloaded_template
+                    .ok_or(Error::InvalidArgument("follow_up click_template missing"))?;
+                let display = display_key.map(|key| self.display(key)).transpose()?;
+                let live_frame = {
+                    let gui = self.gui()?;
+                    let mut guard = PauseGuard::zero(gui);
+                    verify_follow_up_window(
+                        guard.gui(),
+                        &window,
+                        display.as_ref(),
+                        expected_bounds,
+                        expected_region,
+                        check,
+                    )?;
+                    capture_region(guard.gui(), display.as_ref(), expected_region)?
+                };
+                let centers = locate_unique_centers(needle, &live_frame, *confidence)?;
+                if centers.is_empty() {
+                    return Err(Error::InvalidArgument(
+                        "follow_up click_template found no match on current window",
+                    ));
+                }
+                if centers.len() > 1 {
+                    return Err(Error::InvalidArgument(
+                        "follow_up click_template matched multiple candidates",
+                    ));
+                }
+                let point = Point::new(
+                    expected_region.left + centers[0].x,
+                    expected_region.top + centers[0].y,
+                );
+                self.dispatch_follow_up_pointer(
+                    &window,
+                    display_key,
+                    expected_bounds,
+                    expected_region,
+                    point,
+                    None,
+                    check,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_follow_up_pointer(
+        &mut self,
+        window: &Window,
+        display_key: Option<&str>,
+        expected_bounds: Rect,
+        expected_region: Rect,
+        point: Point,
+        scroll: Option<(i32, bool)>,
+        check: &dyn Fn() -> Result<()>,
+    ) -> Result<()> {
+        let display = display_key.map(|key| self.display(key)).transpose()?;
+        let _ = self.gui()?;
+        self.decisions.action_attempts += 1;
+        let gui = self.gui()?;
+        send_pointer_at(
+            gui,
+            display.as_ref(),
+            point,
+            scroll,
+            |gui| {
+                verify_follow_up_window(
+                    gui,
+                    window,
+                    display.as_ref(),
+                    expected_bounds,
+                    expected_region,
+                    check,
+                )
+            },
+            |gui| {
+                verify_follow_up_window(
+                    gui,
+                    window,
+                    display.as_ref(),
+                    expected_bounds,
+                    expected_region,
+                    check,
+                )
+            },
+            check,
+        )
     }
 
     fn passive_frame(
@@ -1106,61 +1337,107 @@ impl Session {
                 );
             }
         };
-        self.finish_observation(&pending, display, action, wait, started, check)
+        self.finish_observation(&pending, display, action, wait, true, started, check)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn finish_observation(
         &mut self,
         pending: &Pending,
         display: Option<String>,
         action: Value,
         wait: WaitPolicy,
+        return_image: bool,
         started: Instant,
         check: &dyn Fn() -> Result<()>,
     ) -> Result<Value> {
         let observed = self.wait_for_frame(&pending.target, display.as_deref(), wait, check);
         match observed {
-            Ok((frame, settled, samples)) => {
-                let Some(next_generation) = self.capture_generation.checked_add(1) else {
-                    self.capture = None;
-                    return Ok(observation_error(
-                        pending,
-                        action,
-                        &Error::InvalidArgument("restart capture session"),
-                    ));
-                };
-                let id = format!("c{next_generation}");
-                let metadata = json!({"target":pending.target,"display":display,"region":rect(frame.region),
-                    "capture_id":id,"pointer_coordinates":"image-relative pixels; origin at captured image top-left",
-                    "expires_in_seconds":60,"single_use":true,"decision_id":pending.id,
-                    "candidate_id":pending.candidate.id,"input_attempted":true,"input_sent":true,
-                    "outcome":if settled {"settled"} else {"timeout"},"task_success":"not_evaluated",
-                    "samples":samples,"latency_ms":started.elapsed().as_millis(),"action":action,
-                    "note":"Visual stability is not semantic completion. Inspect this fresh capture before the next action."});
-                let output = match png(&frame.pixels, metadata) {
-                    Ok(output) => output,
-                    Err(error) => {
-                        self.capture = None;
-                        return Ok(observation_error(pending, action, &error));
-                    }
-                };
-                self.capture_generation = next_generation;
-                self.capture = Some(CaptureProof {
-                    id,
-                    target: pending.target.clone(),
-                    display,
-                    bounds: frame.bounds,
-                    region: frame.region,
-                    frame: frame.pixels,
-                    taken: Instant::now(),
-                });
-                Ok(output)
-            }
+            Ok((frame, settled, samples)) => Ok(self.finalize_observed_frame(
+                pending,
+                display,
+                action,
+                frame,
+                settled,
+                samples,
+                return_image,
+                started,
+            )),
             Err(error) => {
                 self.capture = None;
                 Ok(observation_error(pending, action, &error))
             }
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finalize_observed_frame(
+        &mut self,
+        pending: &Pending,
+        display: Option<String>,
+        action: Value,
+        frame: Frame,
+        settled: bool,
+        samples: u64,
+        return_image: bool,
+        started: Instant,
+    ) -> Value {
+        let Some(next_generation) = self.capture_generation.checked_add(1) else {
+            self.capture = None;
+            return observation_error(
+                pending,
+                action,
+                &Error::InvalidArgument("restart capture session"),
+            );
+        };
+        let id = format!("c{next_generation}");
+        let note = if return_image {
+            "Visual stability is not semantic completion. Inspect this fresh capture before the next action."
+        } else {
+            "Image omitted by caller (return_image=false); capture_id issued for next step. Verify the result before irreversible actions."
+        };
+        let metadata = json!({
+            "target": pending.target,
+            "display": display,
+            "region": rect(frame.region),
+            "capture_id": id,
+            "pointer_coordinates": "image-relative pixels; origin at captured image top-left",
+            "expires_in_seconds": 60,
+            "single_use": true,
+            "decision_id": pending.id,
+            "candidate_id": pending.candidate.id,
+            "input_attempted": true,
+            "input_sent": true,
+            "image_omitted": !return_image,
+            "outcome": if settled { "settled" } else { "timeout" },
+            "task_success": "not_evaluated",
+            "samples": samples,
+            "latency_ms": started.elapsed().as_millis(),
+            "action": action,
+            "note": note,
+        });
+        let output = if return_image {
+            match png(&frame.pixels, metadata) {
+                Ok(output) => output,
+                Err(error) => {
+                    self.capture = None;
+                    return observation_error(pending, action, &error);
+                }
+            }
+        } else {
+            text(metadata)
+        };
+        self.capture_generation = next_generation;
+        self.capture = Some(CaptureProof {
+            id,
+            target: pending.target.clone(),
+            display,
+            bounds: frame.bounds,
+            region: frame.region,
+            frame: frame.pixels,
+            taken: Instant::now(),
+        });
+        output
     }
 
     fn wait_for_frame(
@@ -1229,6 +1506,30 @@ enum SelectPlan {
     },
 }
 
+fn verify_follow_up_window(
+    gui: &mut AutoGui,
+    window: &Window,
+    display: Option<&Display>,
+    expected_bounds: Rect,
+    expected_region: Rect,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    check()?;
+    active(window)?;
+    if window.box_rect()? != expected_bounds {
+        return Err(Error::InvalidArgument(
+            "window moved during follow_up; inspect before retrying",
+        ));
+    }
+    let current_region = screen_region(gui, window, display)?;
+    if current_region != expected_region {
+        return Err(Error::InvalidArgument(
+            "window display region changed during follow_up; inspect before retrying",
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_select_plan(
     proof: &CaptureProof,
     candidates: &[SelectCandidate],
@@ -1246,15 +1547,6 @@ fn resolve_select_plan(
         }));
     }
 
-    let has_templates = preloaded_templates.iter().any(Option::is_some);
-    let mut matcher = has_templates.then(|| {
-        let mut gui = AutoGui::with_fake(FakeBackend::new(1, 1));
-        gui.settings_mut().pause = Duration::ZERO;
-        gui.settings_mut().failsafe = false;
-        gui.set_raise_image_not_found(false);
-        gui
-    });
-
     let mut slow_candidates: Vec<GuiCandidate> = Vec::with_capacity(candidates.len());
     let mut unique_template_indices: Vec<usize> = Vec::new();
     let mut ambiguous = false;
@@ -1263,25 +1555,10 @@ fn resolve_select_plan(
     for (idx, candidate) in candidates.iter().enumerate() {
         check()?;
         if let Some((needle, confidence)) = preloaded_templates.get(idx).and_then(Option::as_ref) {
-            let valid_centers =
-                if needle.width > proof.frame.width || needle.height > proof.frame.height {
-                    Vec::new()
-                } else if let Some(gui) = matcher.as_mut() {
-                    let hits = gui.locate_all(
-                        needle,
-                        &proof.frame,
-                        &LocateOptions {
-                            confidence: *confidence,
-                            ..Default::default()
-                        },
-                    )?;
-                    hits.into_iter()
-                        .map(center)
-                        .filter(|pt| proof.point(&proof.target, &proof.id, pt.x, pt.y).is_ok())
-                        .collect::<Vec<_>>()
-                } else {
-                    Vec::new()
-                };
+            let valid_centers = locate_unique_centers(needle, &proof.frame, *confidence)?
+                .into_iter()
+                .filter(|pt| proof.point(&proof.target, &proof.id, pt.x, pt.y).is_ok())
+                .collect::<Vec<_>>();
 
             if valid_centers.len() == 1 {
                 let pt = valid_centers[0];
@@ -1540,6 +1817,7 @@ mod tests {
             .decision_call("decision_status", json!({}), &|| Ok(()))
             .unwrap();
         assert!(session.decisions.engine.is_none());
+        assert!(session.decisions.cached_gemini_cli.is_some());
         let status_json: Value =
             serde_json::from_str(status["content"][0]["text"].as_str().unwrap()).unwrap();
         let expected_mode = match std::env::var("RSGUI_DECISION_MODE")
@@ -1602,6 +1880,51 @@ mod tests {
         assert_eq!(merged["outcome"], "observation_error");
         assert_eq!(merged["input_sent"], true);
         assert_eq!(merged["evaluation"]["decision_id"], "d1");
+
+        // return_image=false omits image content block while issuing a fresh CaptureProof.
+        let omitted = session.finalize_observed_frame(
+            &pending,
+            None,
+            json!({"clicked":true}),
+            Frame {
+                bounds: Rect::new(10, 10, 100, 100),
+                region: Rect::new(10, 10, 100, 100),
+                pixels: Screenshot::solid(100, 100, autogui::Rgb::new(1, 2, 3)),
+                taken: Instant::now(),
+            },
+            true,
+            2,
+            false,
+            Instant::now(),
+        );
+        assert_eq!(omitted["content"].as_array().unwrap().len(), 1);
+        let omitted_json: Value =
+            serde_json::from_str(omitted["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(omitted_json["image_omitted"], true);
+        assert_eq!(omitted_json["capture_id"], "c1");
+        assert_eq!(session.capture.as_ref().unwrap().id, "c1");
+
+        let included = session.finalize_observed_frame(
+            &pending,
+            None,
+            json!({"clicked":true}),
+            Frame {
+                bounds: Rect::new(10, 10, 100, 100),
+                region: Rect::new(10, 10, 100, 100),
+                pixels: Screenshot::solid(100, 100, autogui::Rgb::new(1, 2, 3)),
+                taken: Instant::now(),
+            },
+            true,
+            2,
+            true,
+            Instant::now(),
+        );
+        assert_eq!(included["content"].as_array().unwrap().len(), 2);
+        assert_eq!(included["content"][1]["type"], "image");
+        let included_json: Value =
+            serde_json::from_str(included["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(included_json["image_omitted"], false);
+        assert_eq!(included_json["capture_id"], "c2");
     }
 
     #[test]
@@ -1610,7 +1933,8 @@ mod tests {
             capture: Some(proof()),
             ..Default::default()
         };
-        // Reject follow_up > 4, delay > 500, activate+capture_id, missing action+template, dup ids
+        // Reject follow_up > 8, delay > 500, out-of-bounds follow_up pointer, missing template,
+        // activate+capture_id, missing action+template, dup ids
         for bad in [
             json!({"target":"w1","capture_id":"c1","activate":true,"goal":"g","candidates":[{"id":"a","description":"d","action":{"type":"hotkey","keys":["enter"]}}]}),
             json!({"target":"w1","capture_id":"c1","goal":"g","candidates":[{"id":"a","description":"d"}]}),
@@ -1620,8 +1944,14 @@ mod tests {
             ]}),
             json!({"target":"w1","capture_id":"c1","goal":"g","candidates":[{"id":"a","description":"d","action":{"type":"click","x":1,"y":1}}],"follow_up":[{"type":"hotkey","keys":["enter"],"delay_ms":501}]}),
             json!({"target":"w1","capture_id":"c1","goal":"g","candidates":[{"id":"a","description":"d","action":{"type":"click","x":1,"y":1}}],"follow_up":[
-                {"type":"hotkey","keys":["enter"]},{"type":"hotkey","keys":["enter"]},{"type":"hotkey","keys":["enter"]},{"type":"hotkey","keys":["enter"]},{"type":"hotkey","keys":["enter"]}
+                {"type":"hotkey","keys":["enter"]},{"type":"hotkey","keys":["enter"]},{"type":"hotkey","keys":["enter"]},
+                {"type":"hotkey","keys":["enter"]},{"type":"hotkey","keys":["enter"]},{"type":"hotkey","keys":["enter"]},
+                {"type":"hotkey","keys":["enter"]},{"type":"hotkey","keys":["enter"]},{"type":"hotkey","keys":["enter"]}
             ]}),
+            json!({"target":"w1","capture_id":"c1","goal":"g","candidates":[{"id":"a","description":"d","action":{"type":"click","x":1,"y":1}}],"follow_up":[{"type":"click","x":999,"y":1}]}),
+            json!({"target":"w1","capture_id":"c1","goal":"g","candidates":[{"id":"a","description":"d","action":{"type":"click","x":1,"y":1}}],"follow_up":[{"type":"scroll","x":-1,"y":1,"clicks":-2}]}),
+            json!({"target":"w1","capture_id":"c1","goal":"g","candidates":[{"id":"a","description":"d","action":{"type":"click","x":1,"y":1}}],"follow_up":[{"type":"click_template","template":{"path":"relative/missing.png"}}]}),
+            json!({"target":"w1","capture_id":"c1","goal":"g","return_image":"no","candidates":[{"id":"a","description":"d","action":{"type":"click","x":1,"y":1}}]}),
         ] {
             assert!(
                 session

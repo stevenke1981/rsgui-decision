@@ -2,7 +2,10 @@ use super::{
     PauseGuard, active, capture_region, display_command, locate_target, scaled_template,
     screen_region, session, window_command,
 };
-use autogui::{AutoGui, Display, Error, LocateOptions, Rect, Result, Screenshot, Window};
+use autogui::{
+    AutoGui, Display, Error, FakeBackend, LocateOptions, Point, Rect, Result, Screenshot, Window,
+    center,
+};
 #[path = "mcp_decision.rs"]
 mod decision;
 #[path = "mcp_input.rs"]
@@ -58,7 +61,7 @@ pub(super) fn encode_png_base64(frame: &Screenshot) -> Result<String> {
         &frame.pixels,
         frame.width,
         frame.height,
-        image::codecs::png::FilterType::Adaptive,
+        image::codecs::png::FilterType::Sub,
     )?;
     Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
 }
@@ -153,6 +156,68 @@ pub(super) fn load_validated_template(
         return Err(Error::InvalidArgument("template exceeds 4 megapixels"));
     }
     Ok((needle, threshold))
+}
+
+pub(super) fn locate_unique_centers(
+    needle: &Screenshot,
+    haystack: &Screenshot,
+    confidence: Option<f32>,
+) -> Result<Vec<Point>> {
+    if needle.width > haystack.width || needle.height > haystack.height {
+        return Ok(Vec::new());
+    }
+    let mut matcher = AutoGui::with_fake(FakeBackend::new(1, 1));
+    matcher.settings_mut().pause = Duration::ZERO;
+    matcher.settings_mut().failsafe = false;
+    matcher.set_raise_image_not_found(false);
+    let hits = matcher.locate_all(
+        needle,
+        haystack,
+        &LocateOptions {
+            confidence,
+            ..Default::default()
+        },
+    )?;
+    Ok(hits
+        .into_iter()
+        .map(center)
+        .filter(|pt| {
+            pt.x >= 0
+                && pt.y >= 0
+                && u32::try_from(pt.x).is_ok_and(|x| x < haystack.width)
+                && u32::try_from(pt.y).is_ok_and(|y| y < haystack.height)
+        })
+        .collect())
+}
+
+pub(super) fn send_pointer_at(
+    gui: &mut AutoGui,
+    display: Option<&Display>,
+    point: Point,
+    scroll: Option<(i32, bool)>,
+    pre_move: impl FnOnce(&mut AutoGui) -> Result<()>,
+    post_move: impl FnOnce(&mut AutoGui) -> Result<()>,
+    check: &dyn Fn() -> Result<()>,
+) -> Result<()> {
+    {
+        let mut guard = super::PauseGuard::zero(gui);
+        pre_move(guard.gui())?;
+        super::move_cursor_and_wait(guard.gui(), display, point, check)?;
+        post_move(guard.gui())?;
+        let actual = guard.gui().position()?;
+        if actual != point {
+            eprintln!("autogui pointer readback: expected={point:?}, actual={actual:?}");
+            return Err(Error::InvalidArgument(
+                "cursor moved before input; capture again",
+            ));
+        }
+    }
+    match scroll {
+        Some((clicks, true)) => gui.hscroll(clicks)?,
+        Some((clicks, false)) => gui.scroll(clicks)?,
+        None => gui.click()?,
+    }
+    Ok(())
 }
 fn png(frame: &Screenshot, metadata: Value) -> Result<Value> {
     let data = encode_png_base64(frame)?;
@@ -610,30 +675,21 @@ impl Session {
                     .map(|key| self.display(key))
                     .transpose()?;
                 let gui = self.gui()?;
-                {
-                    let mut guard = super::PauseGuard::zero(gui);
-                    proof.verify(guard.gui(), &window, display.as_ref(), point, check)?;
-                    super::move_cursor_and_wait(guard.gui(), display.as_ref(), point, check)?;
-                    if allow_hover {
-                        proof.verify_geometry(guard.gui(), &window, display.as_ref(), check)?;
-                    } else {
-                        proof.verify(guard.gui(), &window, display.as_ref(), point, check)?;
-                    }
-                    let actual = guard.gui().position()?;
-                    if actual != point {
-                        eprintln!(
-                            "autogui pointer readback: expected={point:?}, actual={actual:?}"
-                        );
-                        return Err(Error::InvalidArgument(
-                            "cursor moved before input; capture again",
-                        ));
-                    }
-                }
-                match scroll {
-                    Some((clicks, true)) => gui.hscroll(clicks)?,
-                    Some((clicks, false)) => gui.scroll(clicks)?,
-                    None => gui.click()?,
-                }
+                send_pointer_at(
+                    gui,
+                    display.as_ref(),
+                    point,
+                    scroll,
+                    |gui| proof.verify(gui, &window, display.as_ref(), point, check),
+                    |gui| {
+                        if allow_hover {
+                            proof.verify_geometry(gui, &window, display.as_ref(), check)
+                        } else {
+                            proof.verify(gui, &window, display.as_ref(), point, check)
+                        }
+                    },
+                    check,
+                )?;
                 Ok(text(
                     json!({"target":a.target,"capture_id":a.capture_id,"x":point.x,"y":point.y,"clicked":scroll.is_none(),"scroll_clicks":scroll.map(|s|s.0),"horizontal":scroll.map(|s|s.1),"note":"input sent; capture again to verify and obtain a new single-use proof"}),
                 ))

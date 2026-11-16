@@ -1267,4 +1267,14 @@ fn discovery_detects_sidecar_cli_and_probe_flag() {
     });
     assert!(!probe_sidecar_health(err_addr, Duration::from_millis(250)));
     err_thread.join().unwrap();
+
+    // Runtime initializer skips PATH/sidecar probes; cached probe reuses pre-populated CLI slot.
+    let mut cached_cli = Some(true);
+    let cached_discovery =
+        Engine::probe_discovery_cached(Mode::Auto, false, &mut cached_cli).unwrap();
+    assert!(cached_discovery.gemini_core_cli);
+    assert!(cached_discovery.available);
+    let runtime_engine = Engine::from_env_runtime().unwrap();
+    assert!(!runtime_engine.discovery().sidecar_healthy);
+    assert!(!runtime_engine.discovery().gemini_core_cli);
 }

@@ -453,7 +453,7 @@
   },
   {
     "name": "decision_select",
-    "description": "Accelerated hybrid UI selection and execution in one host call: captures automatically when capture_id is omitted, resolves unique local template matches or sole candidates via Fast-Path (0 remote calls), escalates ambiguous multi-candidate choices to Gemini Decision 1 (with downscaled inference PNG and HTTP keep-alive), executes primary click with hover resilience plus up to 4 validated follow-up text/hotkey actions, waits with caret-blink tolerance, and returns a fresh capture_id and PNG.",
+    "description": "Accelerated hybrid UI selection and execution in one host call: captures automatically when capture_id is omitted, resolves unique local template matches or sole candidates via Fast-Path (0 remote calls), escalates ambiguous multi-candidate choices to Gemini Decision 1 (with downscaled inference PNG and HTTP keep-alive), executes primary click with hover resilience plus up to 8 validated follow-up actions (type_text, hotkey, click, scroll, click_template), waits with caret-blink tolerance, and returns a fresh capture_id and optional PNG (return_image defaults true; set false to omit intermediate image payloads).",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -628,7 +628,7 @@
         },
         "follow_up": {
           "type": "array",
-          "maxItems": 4,
+          "maxItems": 8,
           "items": {
             "oneOf": [
               {
@@ -683,6 +683,119 @@
                   "keys"
                 ],
                 "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "click"
+                  },
+                  "x": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "y": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "delay_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 500,
+                    "default": 0
+                  }
+                },
+                "required": [
+                  "type",
+                  "x",
+                  "y"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "scroll"
+                  },
+                  "x": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "y": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "clicks": {
+                    "type": "integer",
+                    "minimum": -100,
+                    "maximum": 100,
+                    "not": {
+                      "const": 0
+                    }
+                  },
+                  "horizontal": {
+                    "type": "boolean"
+                  },
+                  "delay_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 500,
+                    "default": 0
+                  }
+                },
+                "required": [
+                  "type",
+                  "x",
+                  "y",
+                  "clicks"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "type": {
+                    "const": "click_template"
+                  },
+                  "template": {
+                    "type": "object",
+                    "properties": {
+                      "path": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "confidence": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1
+                      },
+                      "exact": {
+                        "type": "boolean"
+                      },
+                      "scale": {
+                        "type": "number",
+                        "minimum": 0.1,
+                        "maximum": 4
+                      }
+                    },
+                    "required": [
+                      "path"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "delay_ms": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 500,
+                    "default": 0
+                  }
+                },
+                "required": [
+                  "type",
+                  "template"
+                ],
+                "additionalProperties": false
               }
             ]
           }
@@ -692,6 +805,10 @@
           "minimum": 0.5,
           "maximum": 1,
           "default": 0.85
+        },
+        "return_image": {
+          "type": "boolean",
+          "default": true
         },
         "wait": {
           "type": "object",
