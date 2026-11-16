@@ -33,11 +33,11 @@ function Test-SidecarHealth([int]$Port) {
     $client = New-Object System.Net.Sockets.TcpClient
     try {
         $task = $client.ConnectAsync('127.0.0.1', $Port)
-        if (-not $task.Wait(150)) {
+        if (-not $task.Wait(200)) {
             return $false
         }
-        $client.ReceiveTimeout = 200
-        $client.SendTimeout = 200
+        $client.ReceiveTimeout = 500
+        $client.SendTimeout = 500
         $stream = $client.GetStream()
         $req = [Text.Encoding]::ASCII.GetBytes("GET /health HTTP/1.1`r`nHost: 127.0.0.1`r`nConnection: close`r`n`r`n")
         $stream.Write($req, 0, $req.Length)

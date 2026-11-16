@@ -146,10 +146,12 @@ $listener = New-Object System.Net.Sockets.TcpListener([Net.IPAddress]::Loopback,
 $listener.Start()
 $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
 $acceptTask = $listener.AcceptTcpClientAsync()
+$readyEvent = New-Object System.Threading.ManualResetEventSlim($false)
 try {
     $sidecarRunspace = [PowerShell]::Create()
     $null = $sidecarRunspace.AddScript({
-        param($Task)
+        param($Task, $Ready)
+        $Ready.Set()
         $client = $Task.GetAwaiter().GetResult()
         try {
             $stream = $client.GetStream()
@@ -161,17 +163,20 @@ try {
         } finally {
             $client.Dispose()
         }
-    }).AddArgument($acceptTask)
+    }).AddArgument($acceptTask).AddArgument($readyEvent)
     $asyncHandle = $sidecarRunspace.BeginInvoke()
+    Assert ($readyEvent.Wait(5000)) 'Sidecar fixture failed to become ready'
     $withSidecar = Invoke-Hook $sessionCmd @{ hookEventName = 'SessionStart'; conversationId = 'test' } @{
         RSGUI_DECISION_PROBE_SIDECAR = '1'
         RSGUI_HOOK_TEST_SIDECAR_PORT = "$port"
     }
     $sidecarRunspace.EndInvoke($asyncHandle)
     $sidecarRunspace.Dispose()
+    Assert ($null -ne $withSidecar.PSObject.Properties['injectSteps'] -and $withSidecar.injectSteps.Count -eq 1) "Expected injectSteps when loopback sidecar is healthy, got: $($withSidecar | ConvertTo-Json -Compress)"
     $sidecarMsg = [string]$withSidecar.injectSteps[0].systemMessage.systemMessage
     Assert ($sidecarMsg -match 'sidecar=True') "Expected sidecar=True in message: $sidecarMsg"
 } finally {
+    $readyEvent.Dispose()
     $listener.Stop()
 }
 
