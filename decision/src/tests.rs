@@ -162,9 +162,13 @@ fn auto_default_prioritizes_key_when_present_and_falls_back_when_absent() {
             .unwrap();
     assert_eq!(with_key.mode(), Mode::Auto);
     assert!(with_key.has_provider());
+    assert_eq!(with_key.image_resolution(), Some("medium"));
     assert!(with_key.discovery().api_key_configured);
     assert!(with_key.discovery().available);
     assert!(with_key.needs_image(&input()));
+    assert!(with_key.provider.as_ref().unwrap().client.get().is_none());
+    with_key.warm_up_client();
+    assert!(with_key.provider.as_ref().unwrap().client.get().is_some());
 }
 
 #[test]
@@ -661,11 +665,22 @@ fn low_confidence_and_disagreement_never_choose_the_first_candidate() {
     let mut body = answer("save", 0.99);
     body["answers"]["next_action"]["probabilities"] = json!({"save":0.1,"cancel":0.9});
     cases.push(body);
+    let mut baseline_noul = answer("save", 0.94);
+    baseline_noul["answers"]["done"]["noul"] = json!(0.18);
+    baseline_noul["answers"]["blocked"]["noul"] = json!(0.18);
+    assert_eq!(
+        remote(Mode::Gemini, baseline_noul)
+            .unwrap()
+            .candidate_id
+            .as_deref(),
+        Some("save")
+    );
+
     let mut body = answer("save", 0.99);
-    body["answers"]["done"]["noul"] = json!(0.5);
+    body["answers"]["done"]["noul"] = json!(0.23);
     cases.push(body);
     let mut body = answer("save", 0.99);
-    body["answers"]["blocked"]["noul"] = json!(0.5);
+    body["answers"]["blocked"]["noul"] = json!(0.23);
     cases.push(body);
     let mut body = answer("save", 0.99);
     body["answers"]["next_action"]

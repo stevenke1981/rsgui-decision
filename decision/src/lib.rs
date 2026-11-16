@@ -26,7 +26,9 @@ const CATCHALLS: [&str; 4] = ["observe", "wait", "stop", "done"];
 const MAX_IMAGE_BASE64: usize = 16 * 1024 * 1024;
 const MAX_RESPONSE: u64 = 1024 * 1024;
 const SEMANTIC_THRESHOLD: f64 = 0.85;
-const MAX_AMBIGUOUS_NOUL: f64 = 0.15;
+// Live gemini-decision-1 emits ~0.11-0.16 baseline noul ambiguity on valid UI frames;
+// keep 0.22 conservative ceiling to prevent false LowConfidence fallbacks while blocking >22% ambiguity.
+const MAX_AMBIGUOUS_NOUL: f64 = 0.22;
 const AUTH_COOLDOWN: Duration = Duration::from_secs(600);
 const RATE_LIMIT_DEFAULT_COOLDOWN: Duration = Duration::from_secs(60);
 const MAX_RETRY_AFTER_SECS: u64 = 600;
@@ -172,8 +174,8 @@ impl Error {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ImageResolution {
-    #[default]
     Low,
+    #[default]
     Medium,
     High,
     UltraHigh,
@@ -210,6 +212,10 @@ impl Provider {
             .timeout(self.timeout)
             .redirect(reqwest::redirect::Policy::none())
             .retry(reqwest::retry::never())
+            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_max_idle_per_host(2)
+            .tcp_keepalive(Duration::from_secs(30))
+            .tcp_nodelay(true)
             .default_headers(self.default_headers.clone())
             .build()
             .map_err(|_| Error::Transport)?;
@@ -396,7 +402,7 @@ impl Engine {
             .as_deref()
             .map(|value| value.trim().to_ascii_lowercase())
             .as_deref()
-            .unwrap_or("low")
+            .unwrap_or("medium")
         {
             "low" => ImageResolution::Low,
             "medium" => ImageResolution::Medium,
@@ -448,7 +454,7 @@ impl Engine {
         timeout: Duration,
         endpoint: &str,
     ) -> Result<Self, Error> {
-        Self::configured_with_resolution(mode, key, timeout, endpoint, ImageResolution::Low)
+        Self::configured_with_resolution(mode, key, timeout, endpoint, ImageResolution::default())
     }
 
     fn configured_with_resolution(
@@ -487,6 +493,21 @@ impl Engine {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    pub fn image_resolution(&self) -> Option<&'static str> {
+        self.provider
+            .as_ref()
+            .map(|provider| provider.resolution.as_str())
+    }
+
+    /// Initializes the pooled HTTP/TLS client in memory without making any network requests.
+    pub fn warm_up_client(&self) {
+        if self.mode != Mode::Local
+            && let Some(provider) = self.provider.as_ref()
+        {
+            let _ = provider.client();
+        }
     }
 
     fn hook_context<'a>(&'a self, input: &'a DecisionInput) -> DecisionHookContext<'a> {

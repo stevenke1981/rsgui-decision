@@ -22,7 +22,7 @@ Explicit display coordinates use Windows desktop physical pixels (may be negativ
 Virtual displays require an optional IDD driver; all displays share input/focus.\n\
 Primary-monitor corner fail-safe remains enabled.\n\
 Titles must match one window. close requests WM_CLOSE; it does not confirm exit.\n\n\
-Rust decision integration: decision_observe, decision_evaluate, decision_act, decision_step, decision_status (MCP).\n\
+Rust decision integration: decision_observe, decision_evaluate, decision_act, decision_step, decision_select, decision_status (MCP).\n\
 One stored action + adaptive wait + fresh capture per step.\n\
 RSGUI_DECISION_MODE=auto (default), local, or gemini.\n\
 Remote modes prioritize Gemini Decision 1 when available and send selected window pixels to Google (set GEMINI_API_KEY).\n\

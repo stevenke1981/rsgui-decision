@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Accelerated web and app UI selection by combining `rsgui-decision-core` (Gemini Decision 1) with `rsautogui` and exposed a 20th MCP tool `decision_select`:
+  - Added fast remote inference PNG encoding (`RSGUI_DECISION_MAX_IMAGE_DIM`, default `1280`, preserving native full-resolution `CaptureProof` coordinates) using PNG `FilterType::Sub` and bilinear/triangle downscaling, plus HTTP Keep-Alive connection pooling (`pool_idle_timeout`, `pool_max_idle_per_host`, `tcp_keepalive`, `tcp_nodelay`) and in-process `warm_up_client()`.
+  - Calibrated default `ImageResolution` to `Medium` (matching live `gemini-decision-1` confidence behavior) and raised `MAX_AMBIGUOUS_NOUL` to `0.22`; surfaced `image_resolution` and `max_image_dim` in `decision_status`.
+  - Added web/app UI resilience on `WaitPolicy`: `allow_caret_drift` (`true` default: exact match inside candidate 32x32 patches with bounded `max(64, min(2500, total_pixels / 1000))` out-of-patch caret-blink tolerance) and `allow_hover` (`true` default on `decision_*` actions via internal hover-tolerant pointer dispatch, keeping standalone `click_at`/`scroll` strict).
+  - Implemented `decision_select` combining optional `capture_id` auto-observe/`activate`, local `fast_path_single` / in-memory `fast_path_template` unique-match resolution via `AutoGui::locate_all`, Gemini Decision 1 multi-candidate escalation, and up to 4 validated `follow_up` (`type_text`/`hotkey`, `delay_ms <= 500`) inputs before a single settled capture return.
+
 - Changed default `RSGUI_DECISION_MODE` from `local` to `auto`, added the Rust `DecisionHook` / `PreferGeminiDecisionHook` extension and non-secret `GeminiDiscovery` (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `gemini-core` CLI/`~/.gemini-decision-1`, and bounded loopback `127.0.0.1:8792/health` probe surfaced in `decision_status`), and added Antigravity workspace hooks (`.agents/hooks.json` + `.agents/hooks/prefer-gemini-decision.ps1`) with automated tests (`tests/hooks.ps1`, CI) so Gemini Decision 1 is prioritized whenever present.
 
 - Fixed virtual-desktop pointer coordinate normalization (`MOUSEEVENTF_VIRTUALDESK` over combined monitor bounds, preserving primary-monitor coordinates), scoped Windows DPI guards outside window move/resize/wait loops, eliminated duplicate display enumerations/pixel copies on recognition and capture paths, preserved `settings.pause` / `SPEC.md` read-heavy pauses on `AutoGui` library calls while batching `typewrite` fail-safe checks, and exported `autogui::normalize` plus `Key::Insert` support on the OS backend.

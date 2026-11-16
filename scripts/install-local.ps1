@@ -103,7 +103,7 @@ function VerifyLoader([string]$Path, [switch]$Mcp) {
                 $process.StandardInput.Flush()
             } elseif ($request.id -eq 2) {
                 $tools = @($response.result.tools)
-                if ($tools.Count -ne 19 -or @($tools.name | Sort-Object -Unique).Count -ne 19) { throw "Expected 19 unique MCP tools: $Path" }
+                if ($tools.Count -ne 20 -or @($tools.name | Sort-Object -Unique).Count -ne 20) { throw "Expected 20 unique MCP tools: $Path" }
             } else {
                 if ($response.result.isError) { throw "MCP decision_status failed: $Path ($($response.result.content[0].text))" }
                 $statusPayload = $response.result.content[0].text | ConvertFrom-Json
@@ -300,7 +300,7 @@ try {
     [IO.File]::WriteAllText($manifestPath, ($manifest | ConvertTo-Json -Depth 8), $utf8)
     throw "Local install failed: $failure; manifest=$manifestPath; rollback failures=$($rollbackFailures -join '; ')"
 }
-Write-Host "Installed version $($versions[0]); unsigned package checksums and 19-tool MCP handshakes verified."
+Write-Host "Installed version $($versions[0]); unsigned package checksums and 20-tool MCP handshakes verified."
 Write-Host "Restore manifest: $manifestPath"
 if ($AllowInUseRename) { Write-Host 'Running old images are retained in displaced/. Exit processes using the new files before restore-local.ps1.' }
 # Return the durable manifest path for automation; no host config, PATH or .install metadata is edited.
